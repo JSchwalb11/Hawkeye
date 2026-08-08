@@ -782,16 +782,22 @@ int main(int argc, char *argv[]) {
             map_session_set_focus(&map_session, selected);
             if (is_replay && vehicle_count > 0) {
                 // Replay drives the playhead from the transport position so the
-                // map and the trajectory never disagree about "now".
+                // map and the trajectory never disagree about "now". Each
+                // source clamps its own position at its own end of log, so the
+                // shared playhead has to come from the furthest one still
+                // running -- otherwise loading a 60 s log beside a 600 s one
+                // freezes the map nine tenths of the way short while the other
+                // vehicle keeps flying.
                 const int64_t t0 = timeline_start_ns(&map_session.timeline);
-                const int64_t want = t0 + (int64_t)(sources[0].playback.position_s * 1e9);
-                if (want != map_session.timeline.playhead.t_ns) {
-                    timeline_set_playhead(&map_session.timeline, want);
-                    map_session.timeline.playhead.speed = sources[0].playback.speed;
-                    map_session.timeline.playhead.paused = sources[0].playback.paused;
+                double furthest = 0.0;
+                for (int i = 0; i < vehicle_count; i++) {
+                    if (sources[i].playback.position_s > furthest)
+                        furthest = sources[i].playback.position_s;
                 }
-                timeline_sync_map(&map_session.timeline, &map_session.map);
-                map_ingest_drain(&map_session.ingest, &map_session.map, GetFrameTime());
+                const int64_t want = t0 + (int64_t)(furthest * 1e9);
+                map_session.timeline.playhead.speed = sources[0].playback.speed;
+                map_session.timeline.playhead.paused = sources[0].playback.paused;
+                map_session_tick_at(&map_session, want, GetFrameTime());
             } else {
                 map_session_tick(&map_session, GetFrameTime());
             }
@@ -932,6 +938,17 @@ int main(int argc, char *argv[]) {
 
         // Handle input (blocked during marker label entry)
         if (!marker_input.active) {
+        // The timeline widget gets the pointer first. It is drawn later, inside
+        // BeginDrawing, but its hit test has to run before the camera sees the
+        // same mouse button -- otherwise scrubbing the strip also orbits the
+        // view.
+        scene.ui_pointer_captured = false;
+        if (map_ready && map_hud_opts.show_timeline) {
+            const int th = (int)map_hud_opts.timeline_height;
+            scene.ui_pointer_captured =
+                map_hud_timeline_input(&map_session, 12, GetScreenHeight() - th - 12,
+                                       GetScreenWidth() - 24, th);
+        }
         scene_handle_input(&scene);
 
         // Map controls. Deliberately few: the map is a view of the same data,

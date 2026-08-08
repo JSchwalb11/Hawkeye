@@ -101,6 +101,7 @@ static const rt_orient_t k_orientations[MAV_SENSOR_ORIENTATION_COUNT] = {
     {  90,   0, 270.0f, "ROLL_90_YAW_270" },
     {  90,  68, 293.0f, "ROLL_90_PITCH_68_YAW_293" },
     {   0, 315,   0.0f, "PITCH_315" },
+    {  90, 315,   0.0f, "ROLL_90_PITCH_315" },
 };
 
 bool rt_sensor_orientation_quat(uint8_t orientation, float q[4]) {
@@ -176,8 +177,12 @@ bool rt_build_ray(const ray_obs_t *obs, om_ray_t *out) {
     if (obs->have_quaternion) {
         memcpy(q_bs, obs->sensor_q, sizeof(q_bs));
         rt_quat_normalize(q_bs);
-    } else {
-        rt_sensor_orientation_quat(obs->orientation, q_bs);
+    } else if (!rt_sensor_orientation_quat(obs->orientation, q_bs)) {
+        // An orientation this build does not know is not an excuse to aim the
+        // ray down body +X. A mount we cannot place produces a phantom
+        // obstacle dead ahead and carves free space through wherever the
+        // sensor was really pointing, both silently. Reject it instead.
+        return false;
     }
 
     float q_nb[4];
@@ -217,8 +222,12 @@ int rt_expand_obstacle_distance(const obstacle_obs_t *obs, om_ray_t *out, int ma
     int sectors = obs->sector_count ? obs->sector_count : OBSTACLE_DISTANCE_SECTORS;
     if (sectors > OBSTACLE_DISTANCE_SECTORS) sectors = OBSTACLE_DISTANCE_SECTORS;
 
+    // A signed increment carries the sweep direction: negative means the fan
+    // runs counter-clockwise from angle_offset. Only an exactly-zero (or
+    // non-finite) increment means "unspecified", and only then do we assume
+    // the sectors evenly divide a full turn clockwise.
     float increment = obs->increment_deg;
-    if (!(increment > 0.0f)) increment = 360.0f / (float)sectors;
+    if (increment == 0.0f || !isfinite(increment)) increment = 360.0f / (float)sectors;
 
     const float min_m = (float)obs->min_distance_cm * 0.01f;
     const float max_m = (float)obs->max_distance_cm * 0.01f;

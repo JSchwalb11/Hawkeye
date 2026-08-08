@@ -193,9 +193,22 @@ static bool pool_reserve(octomap_t *m, uint32_t needed) {
         if (cap > (UINT32_MAX / 2)) return false;
         cap *= 2;
     }
-    const size_t want = (size_t)cap * sizeof(om_node_t)
-                      + (size_t)m->chunk_cap * sizeof(om_chunk_slot_t);
-    if (m->byte_cap && want > m->byte_cap) return false;
+    // The chunk table shares the budget and doubles on its own, so keep room
+    // for one more doubling rather than letting the node pool claim the lot.
+    const size_t chunk_cap_now = m->chunk_cap ? m->chunk_cap : OM_CHUNK_INITIAL;
+    const size_t chunk_bytes = chunk_cap_now * 2 * sizeof(om_chunk_slot_t);
+    if (m->byte_cap && chunk_bytes + (size_t)cap * sizeof(om_node_t) > m->byte_cap) {
+        // Doubling overshot the budget. Growing by less is still growing --
+        // refusing outright freezes the pool at the previous power of two and
+        // strands up to half the cap, because nothing about the map's state
+        // changes here, so the next call recomputes the same doubled cap and
+        // refuses again.
+        if (chunk_bytes >= m->byte_cap) return false;
+        size_t room = (m->byte_cap - chunk_bytes) / sizeof(om_node_t);
+        room -= room % OM_NODES_PER_BLOCK;   // the pool only ever hands out blocks
+        if (room < needed || room > UINT32_MAX) return false;
+        cap = (uint32_t)room;
+    }
 
     om_node_t *n = (om_node_t *)realloc(m->nodes, (size_t)cap * sizeof(om_node_t));
     if (!n) return false;

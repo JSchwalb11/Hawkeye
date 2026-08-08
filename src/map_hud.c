@@ -153,10 +153,62 @@ static Color event_colour(uint8_t kind, uint8_t severity) {
     }
 }
 
-bool map_hud_draw_timeline(map_session_t *ms, int x, int y, int width, int height,
+// The widget's geometry, shared by the input and draw passes so the two can
+// never disagree about where the track is.
+typedef struct { int track_x, track_y, track_w, track_h, btn_x; } tl_rect_t;
+
+static tl_rect_t tl_layout(int x, int y, int width, int height) {
+    tl_rect_t r;
+    r.track_x = x + MH_PAD;
+    r.track_w = width - 2 * MH_PAD - 74;
+    r.track_y = y + 26;
+    r.track_h = height - 34;
+    r.btn_x   = x + width - MH_PAD - 64;
+    return r;
+}
+
+bool map_hud_timeline_input(map_session_t *ms, int x, int y, int width, int height) {
+    if (!ms) return false;
+    timeline_t *tl = &ms->timeline;
+
+    const int64_t t0 = timeline_start_ns(tl);
+    const int64_t t1 = timeline_head_ns(tl);
+    const double span = (double)(t1 - t0);
+
+    const tl_rect_t r = tl_layout(x, y, width, height);
+    const Vector2 m = GetMousePosition();
+
+    // Over the widget at all? Reported even when there is nothing to scrub, so
+    // a click on the strip never falls through to the camera.
+    const bool over = (m.x >= x && m.x <= x + width && m.y >= y && m.y <= y + height);
+    if (span <= 0.0) return over;
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        m.x >= r.btn_x && m.x <= r.btn_x + 64 &&
+        m.y >= r.track_y && m.y <= r.track_y + r.track_h) {
+        timeline_pin_live(tl);
+    } else if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
+               m.x >= r.track_x && m.x <= r.track_x + r.track_w &&
+               m.y >= r.track_y - 6 && m.y <= r.track_y + r.track_h + 6) {
+        double frac = (double)(m.x - r.track_x) / (double)r.track_w;
+        if (frac < 0.0) frac = 0.0;
+        if (frac > 1.0) frac = 1.0;
+        const int64_t want = t0 + (int64_t)(frac * span);
+        // A resync is a restore-and-replay. Dragging holds the button down for
+        // many frames over the same pixel, so only move when the target has
+        // actually changed -- otherwise the map is rebuilt for nothing.
+        if (want != tl->playhead.t_ns) {
+            timeline_set_playhead(tl, want);
+            map_session_resync(ms);
+        }
+    }
+    return over;
+}
+
+void map_hud_draw_timeline(map_session_t *ms, int x, int y, int width, int height,
                            Font font, const theme_t *theme) {
     (void)theme;
-    if (!ms) return false;
+    if (!ms) return;
     timeline_t *tl = &ms->timeline;
 
     DrawRectangle(x, y, width, height, COL_BG);
@@ -168,13 +220,14 @@ bool map_hud_draw_timeline(map_session_t *ms, int x, int y, int width, int heigh
     if (span <= 0.0) {
         DrawTextEx(font, "TIMELINE  waiting for data",
                    (Vector2){ (float)(x + MH_PAD), (float)(y + 6) }, 12, 1.0f, COL_DIM);
-        return false;
+        return;
     }
 
-    const int track_x = x + MH_PAD;
-    const int track_w = width - 2 * MH_PAD - 74;
-    const int track_y = y + 26;
-    const int track_h = height - 34;
+    const tl_rect_t r = tl_layout(x, y, width, height);
+    const int track_x = r.track_x;
+    const int track_w = r.track_w;
+    const int track_y = r.track_y;
+    const int track_h = r.track_h;
 
     DrawRectangle(track_x, track_y, track_w, track_h, (Color){ 24, 29, 38, 255 });
 
@@ -221,7 +274,7 @@ bool map_hud_draw_timeline(map_session_t *ms, int x, int y, int width, int heigh
 
     // The live button. Scrubbing unpins the playhead; this re-pins it, which is
     // the whole live/replay unification in one control.
-    const int bx = x + width - MH_PAD - 64;
+    const int bx = r.btn_x;
     const int by = track_y;
     const bool hot = tl->playhead.pinned_to_head;
     DrawRectangle(bx, by, 64, track_h, hot ? (Color){ 80, 24, 50, 255 }
@@ -230,19 +283,4 @@ bool map_hud_draw_timeline(map_session_t *ms, int x, int y, int width, int heigh
     DrawTextEx(font, "LIVE", (Vector2){ (float)(bx + 20), (float)(by + track_h / 2 - 6) },
                12, 1.0f, hot ? COL_LIVE : COL_DIM);
 
-    bool interacted = false;
-    const Vector2 m = GetMousePosition();
-    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
-        m.x >= bx && m.x <= bx + 64 && m.y >= by && m.y <= by + track_h) {
-        timeline_pin_live(tl);
-        interacted = true;
-    } else if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
-               m.x >= track_x && m.x <= track_x + track_w &&
-               m.y >= track_y - 6 && m.y <= track_y + track_h + 6) {
-        const double frac = (double)(m.x - track_x) / (double)track_w;
-        timeline_set_playhead(tl, t0 + (int64_t)(frac * span));
-        map_session_resync(ms);
-        interacted = true;
-    }
-    return interacted;
 }

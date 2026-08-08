@@ -101,9 +101,14 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .coverage_min = 0.95, .occupied_cells_min = 400, .occupied_cells_max = -1,
     }, 0, 0, 0 },
 
-    [FX_ORIENTATIONS] = { "orientations", 20.5, 1, 20.0, SENSOR_DISTANCE, 1, {
+    // Every mount is scored on its own. A pooled RMS cannot see one wrong
+    // table entry among forty right ones -- a 10-degree slip in entry 38, the
+    // one entry whose angles are not multiples of 45 and so the likeliest
+    // transcription error, moves the pooled figure by nothing at all.
+    [FX_ORIENTATIONS] = { "orientations", 42.0, 1, 20.0, SENSOR_DISTANCE, 1, {
         .surface_rms_max_m = 0.15, .false_occupied_max = 0.02, .false_free_max = 0.02,
         .coverage_min = 0.95, .occupied_cells_min = 50, .occupied_cells_max = -1,
+        .group_false_free_max = 0.10, .group_min_rays = 8,
     }, 0, 0, 0 },
 
     [FX_MOVING] = { "moving", 25.0, 1, 20.0, SENSOR_DISTANCE, 2, {
@@ -192,6 +197,18 @@ static void add_plane(geom_scene_t *s, double px, double py, double pz,
     geom_plane_make(&s->planes[s->count++], p, n, hu, hv, label);
 }
 
+// Which mount the `orientations` fixture is exercising right now: the 41 enum
+// values plus one custom quaternion, a second each. The dwell is generous
+// because the checker scores every mount separately -- ten rays is enough to
+// convict one, but twenty leaves no argument about sampling.
+#define ORIENT_STEP_S 1.0
+static int orientation_step(double t) { return (int)(t / ORIENT_STEP_S); }
+
+// The mount grid: one plot of ground per mount, spaced far enough apart that a
+// misaimed mount cannot land on a neighbour's plot and be mistaken for it.
+#define ORIENT_GRID_COLS 7
+#define ORIENT_PLOT_M    8.0
+
 static void build_scene(fixture_id_t fx, geom_scene_t *s) {
     memset(s, 0, sizeof(*s));
     switch (fx) {
@@ -200,8 +217,10 @@ static void build_scene(fixture_id_t fx, geom_scene_t *s) {
 
         case FX_GROUND:
         case FX_ORIENTATIONS:
-            add_plane(s, 0, 0, 0, 0, 0, 1, (fx == FX_GROUND) ? 40 : 5,
-                      (fx == FX_GROUND) ? 40 : 5, "ground");
+            // Wide enough to hold the whole grid of per-mount plots.
+            add_plane(s, 0, 0, 0, 0, 0, 1,
+                      (fx == FX_GROUND) ? 40 : ORIENT_GRID_COLS * ORIENT_PLOT_M,
+                      (fx == FX_GROUND) ? 40 : 6 * ORIENT_PLOT_M, "ground");
             break;
 
         case FX_WALL: {
@@ -311,13 +330,24 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             p->yaw = 0.4 * sin(t * 0.25);   // gentle yaw: sector mapping must follow
             break;
 
-        case FX_ORIENTATIONS:
-            // Drift slowly so successive mounts land on different cells; if one
-            // of them points somewhere else, its cells stand out.
-            p->enu[0] += 2.0 * sin(t * 0.30);
-            p->enu[1] += 2.0 * cos(t * 0.27);
+        case FX_ORIENTATIONS: {
+            // Each mount gets its own plot of ground, far enough from its
+            // neighbours that no other mount's rays can cover for it. Drifting
+            // over one shared patch was the flaw in the earlier version: forty
+            // correct mounts painted the same cells the wrong one was supposed
+            // to, so its absence was invisible.
+            const int step = orientation_step(t);
+            const int col = step % ORIENT_GRID_COLS;
+            const int row = step / ORIENT_GRID_COLS;
+            p->enu[0] += ((double)col - (ORIENT_GRID_COLS - 1) * 0.5) * ORIENT_PLOT_M;
+            p->enu[1] += ((double)row - 2.5) * ORIENT_PLOT_M;
+            // A little movement inside the plot so the footprint is a few cells
+            // wide and the score is not one cell's worth of quantisation.
+            p->enu[0] += 0.4 * sin(t * 3.1);
+            p->enu[1] += 0.4 * cos(t * 2.7);
             p->enu[2] = 10.1;
             break;   // attitude is derived per-observation from the mount under test
+        }
 
         case FX_MOVING:
             p->enu[0] += 8.0 * sin(t * 0.25);
@@ -387,10 +417,6 @@ typedef struct {
     uint8_t signal_quality;
 } sensor_cfg_t;
 
-// Which mount the `orientations` fixture is exercising right now. 40 enum values
-// plus one custom quaternion, half a second each.
-#define ORIENT_STEP_S 0.5
-static int orientation_step(double t) { return (int)(t / ORIENT_STEP_S); }
 
 static void sensor_config(fixture_id_t fx, int veh, double t, sensor_cfg_t *c) {
     memset(c, 0, sizeof(*c));
@@ -632,6 +658,12 @@ static void record_truth_ray(sim_t *s, double t, int veh, const double origin[3]
     }
     r.vehicle = (uint8_t)veh;
     r.hit = hit ? 1 : 0;
+    // The mount test walks one orientation at a time, so the step index is the
+    // group the checker scores separately.
+    if (s->fx == FX_ORIENTATIONS) {
+        const int step = orientation_step(t);
+        r.group = (uint8_t)((step >= 0 && step < 255) ? step : 255);
+    }
     truth_writer_ray(&s->truth, &r);
 }
 

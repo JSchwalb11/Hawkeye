@@ -30,7 +30,12 @@ typedef struct {
     float   endpoint[3];   // true endpoint: the surface hit, or the max-range point
     uint8_t vehicle;
     uint8_t hit;           // 0 == no return
-    uint8_t pad[2];
+    // Which sub-case of the fixture cast this ray. `orientations` sets it to
+    // the mount index, so the checker can score each of the 41 mounts on its
+    // own instead of averaging one bad entry away against forty good ones.
+    // 0 for fixtures with nothing to group by.
+    uint8_t group;
+    uint8_t pad;
 } truth_ray_t;
 
 typedef struct {
@@ -59,6 +64,10 @@ typedef struct {
     // at the range's own timestamp, both would smear and the pair would fail.
     double  vehicle0_rms_max;
     double  vehicle1_rms_min;
+    // Worst single group's false-free rate. A pooled average cannot see one
+    // wrong orientation-table entry among forty right ones; this can.
+    double  group_false_free_max;   // 0 = unchecked
+    int     group_min_rays;         // groups thinner than this are not scored
 } truth_thresholds_t;
 
 typedef struct {

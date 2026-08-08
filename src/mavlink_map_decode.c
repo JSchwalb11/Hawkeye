@@ -120,9 +120,11 @@ static void handle_obstacle_distance(map_session_t *ms, int slot, int64_t t_ns,
     memcpy(o.distances_cm, d.distances, sizeof(o.distances_cm));
     o.sector_count = OBSTACLE_DISTANCE_SECTORS;
     o.frame = d.frame;
-    // increment_f is the float form and takes precedence when populated; the
-    // integer `increment` is degrees. An off-by-one here rotates the whole map.
-    o.increment_deg = (d.increment_f > 0.0f) ? d.increment_f : (float)d.increment;
+    // increment_f is the float form and takes precedence whenever it is
+    // non-zero -- including when it is negative, which is how a sender says
+    // the sweep runs counter-clockwise. Testing for > 0 drops that sign and
+    // mirrors the entire fan about the nose.
+    o.increment_deg = (d.increment_f != 0.0f) ? d.increment_f : (float)d.increment;
     o.angle_offset_deg = d.angle_offset;
     o.min_distance_cm = d.min_distance;
     o.max_distance_cm = d.max_distance;

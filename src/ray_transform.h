@@ -28,7 +28,10 @@
 extern "C" {
 #endif
 
-#define MAV_SENSOR_ORIENTATION_COUNT 40
+// MAV_SENSOR_ROTATION_NONE (0) through MAV_SENSOR_ROTATION_ROLL_90_PITCH_315
+// (40) are contiguous; the enum then jumps to MAV_SENSOR_ROTATION_CUSTOM=100,
+// which only means anything alongside a quaternion.
+#define MAV_SENSOR_ORIENTATION_COUNT 41
 #define OBSTACLE_DISTANCE_SECTORS    72
 
 // --- Small quaternion helpers (w, x, y, z) -----------------------------

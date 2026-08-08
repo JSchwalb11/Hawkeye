@@ -161,6 +161,11 @@ typedef struct {
     double   veh_mean_lo[TRUTH_MAX_VEHICLES];
     double   veh_rms[TRUTH_MAX_VEHICLES];
     uint64_t veh_cells[TRUTH_MAX_VEHICLES];
+    // Worst-scoring group and its rate. For `orientations` the group is the
+    // mount index, so this names the offending table entry outright.
+    double   group_worst_false_free;
+    int      group_worst_id;
+    int      group_scored;
 } report_t;
 
 static void configure_session(map_session_t *ms, const truth_t *t) {
@@ -284,6 +289,14 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
     const double leaf = octomap_cell_size(&ms->map, ms->map.max_depth);
     uint64_t surf_free = 0, surf_occ = 0;
     uint64_t swept = 0, observed = 0;
+    // Per-group surface representation. Unlike the pooled false-free rate this
+    // counts a surface the map simply never heard of, not only one it actively
+    // called free -- a mount aimed at the wrong patch of sky leaves its true
+    // endpoint UNKNOWN, and that has to score as a miss or the check is blind
+    // to exactly the failure it exists for.
+    static uint32_t grp_total[256], grp_occ[256];
+    memset(grp_total, 0, sizeof(grp_total));
+    memset(grp_occ, 0, sizeof(grp_occ));
 
     const uint32_t stride = (t->ray_count > 200000u) ? (t->ray_count / 200000u) : 1u;
     for (uint32_t i = 0; i < t->ray_count; i += stride) {
@@ -314,7 +327,8 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
                     if (st == OM_OCCUPIED) represented = true;
                     else if (st == OM_FREE) any_free = true;
                 }
-                if (represented) surf_occ++;
+                grp_total[ray->group]++;
+                if (represented) { surf_occ++; grp_occ[ray->group]++; }
                 else if (any_free) surf_free++;
             }
         }
@@ -329,6 +343,21 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
     rep->false_free_rate = (surf_free + surf_occ)
         ? (double)surf_free / (double)(surf_free + surf_occ) : 0.0;
     rep->coverage = swept ? (double)observed / (double)swept : 0.0;
+
+    {
+        const int min_rays = t->header.thresholds.group_min_rays > 0
+                           ? t->header.thresholds.group_min_rays : 4;
+        rep->group_worst_id = -1;
+        for (int g = 0; g < 256; g++) {
+            if ((int)grp_total[g] < min_rays) continue;
+            rep->group_scored++;
+            const double rate = 1.0 - (double)grp_occ[g] / (double)grp_total[g];
+            if (rep->group_worst_id < 0 || rate > rep->group_worst_false_free) {
+                rep->group_worst_false_free = rate;
+                rep->group_worst_id = g;
+            }
+        }
+    }
 
     // One final prune, reported. Most of the collapsing already happened on the
     // ingest layer's own schedule, so a small number here is the healthy case
@@ -355,6 +384,13 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
             bad += fail("false-occupied rate", r->false_occupied_rate, ">", th->false_occupied_max);
         if (r->false_free_rate > th->false_free_max)
             bad += fail("false-free rate", r->false_free_rate, ">", th->false_free_max);
+        if (th->group_false_free_max > 0.0 &&
+            r->group_worst_false_free > th->group_false_free_max) {
+            printf("  FAIL  %-24s %.6g > %.6g  (group %d of %d)\n",
+                   "worst-group false-free", r->group_worst_false_free,
+                   th->group_false_free_max, r->group_worst_id, r->group_scored);
+            bad++;
+        }
     }
 
     if (th->coverage_min > 0.0 && r->coverage < th->coverage_min)
@@ -441,6 +477,9 @@ static void print_report(const truth_t *t, const report_t *r) {
     printf("  surface RMS            %.4f m  (max %.4f m)\n", r->surface_rms, r->surface_max);
     printf("  false-occupied rate    %.5f\n", r->false_occupied_rate);
     printf("  false-free rate        %.5f\n", r->false_free_rate);
+    if (r->group_scored > 1)
+        printf("  worst-group false-free %.5f  (group %d of %d scored)\n",
+               r->group_worst_false_free, r->group_worst_id, r->group_scored);
     printf("  coverage completeness  %.5f\n", r->coverage);
     printf("  cells occupied/free    %llu / %llu\n",
            (unsigned long long)r->occupied_cells, (unsigned long long)r->free_cells);

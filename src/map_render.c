@@ -301,8 +301,22 @@ void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
     const int sw = GetScreenWidth(), sh = GetScreenHeight();
     const float aspect = (sh > 0) ? (float)sw / (float)sh : 1.0f;
     Matrix view = MatrixLookAt(camera.position, camera.target, camera.up);
-    Matrix proj = MatrixPerspective(camera.fovy * DEG2RAD, aspect,
-                                    RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR);
+    // The fullscreen ortho views hand in an orthographic camera, where raylib
+    // reuses fovy as a world-space span in metres rather than an angle.
+    // Feeding that span to MatrixPerspective gives tan(half-span) of a number
+    // far past 90 degrees and a degenerate matrix that culls the entire map,
+    // so the projection has to match what BeginMode3D will actually issue.
+    const bool ortho = (camera.projection == CAMERA_ORTHOGRAPHIC);
+    Matrix proj;
+    if (ortho) {
+        const double top = camera.fovy * 0.5;
+        const double right = top * aspect;
+        proj = MatrixOrtho(-right, right, -top, top,
+                           RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR);
+    } else {
+        proj = MatrixPerspective(camera.fovy * DEG2RAD, aspect,
+                                 RL_CULL_DISTANCE_NEAR, RL_CULL_DISTANCE_FAR);
+    }
     frustum_t frustum;
     frustum_from_matrix(&frustum, MatrixMultiply(view, proj));
 
@@ -310,6 +324,8 @@ void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
     uint32_t cursor = 0;
     int64_t key;
     int extracted = 0;
+
+    bool all_latched = true;
 
     while (octomap_chunk_next(&ms->map, &cursor, &key)) {
         r->stats.chunks_live++;
@@ -325,19 +341,33 @@ void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
         const float dy = c.y - camera.position.y;
         const float dz = c.z - camera.position.z;
         const float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-        if (dist - radius > r->max_draw_distance_m) continue;
+
+        // Find (or create) the cache entry before any culling, so a chunk that
+        // is off-screen this frame still latches the map's all-dirty flag. A
+        // single global flag cannot be the re-extract signal for a set the
+        // renderer only partially visits: cull first and the chunks behind the
+        // camera would report clean forever and keep drawing pre-prune
+        // geometry.
+        map_chunk_t *chunk = chunk_find(r, key, true);
+        if (!chunk) { all_latched = false; continue; }
+        if (octomap_chunk_is_dirty(&ms->map, key)) chunk->needs_extract = true;
+
+        // In ortho there is no meaningful eye distance -- the camera sits an
+        // arbitrary way back along the view axis and everything in the slab is
+        // the same size on screen -- so only the frustum decides.
+        if (!ortho && dist - radius > r->max_draw_distance_m) continue;
         if (!frustum_sphere(&frustum, c, radius)) continue;
 
-        map_chunk_t *chunk = chunk_find(r, key, true);
-        if (!chunk) continue;
         chunk->center = c;
         chunk->size = (float)size;
 
-        const int lod = lod_for_distance(&ms->map, dist);
-        const bool dirty = octomap_chunk_is_dirty(&ms->map, key);
+        const int lod = ortho ? lod_for_distance(&ms->map, 0.0f)
+                              : lod_for_distance(&ms->map, dist);
+        const bool dirty = chunk->needs_extract;
         if ((dirty || chunk->lod_depth != lod) && extracted < r->extract_budget) {
             extract_chunk(r, ms, chunk, lod);
             octomap_chunk_clear_dirty(&ms->map, key);
+            chunk->needs_extract = false;
             extracted++;
         } else if (chunk->lod_depth < 0) {
             continue;   // never extracted and out of budget this frame
@@ -363,9 +393,11 @@ void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
         }
     }
 
-    // The map's own all-dirty flag is cleared once every visible chunk has had
-    // a chance to re-extract; otherwise a scrub could leave stale geometry.
-    if (ms->map.all_dirty && extracted < r->extract_budget) ms->map.all_dirty = false;
+    // The all-dirty flag is cleared once every live chunk has latched it into
+    // its own needs_extract bit -- not once the visible ones have re-extracted.
+    // Extraction is budgeted and culled; latching is neither, so this is the
+    // only point at which the flag has genuinely been consumed by everyone.
+    if (ms->map.all_dirty && all_latched) ms->map.all_dirty = false;
 
     r->stats.extract_ms = (float)((GetTime() - t0) * 1000.0);
 }

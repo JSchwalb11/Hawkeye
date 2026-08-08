@@ -41,6 +41,9 @@ typedef struct {
     Vector3  center;      // world (Raylib) coordinates
     float    size;
     int      lod_depth;   // depth this chunk was extracted at
+    // Latched from the map's dirty bits before culling, so a chunk that is
+    // off-screen when the map changes still rebuilds when it comes back.
+    bool     needs_extract;
     Matrix  *xf[MAP_RENDER_BUCKETS];
     int      count[MAP_RENDER_BUCKETS];
     int      cap[MAP_RENDER_BUCKETS];

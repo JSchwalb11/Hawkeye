@@ -26,10 +26,16 @@ skynet_log_kind_t skynet_kind_from_path(const char *path) {
 
 // ---------------------------------------------------------------- JSON
 
+// A run record is the one input here that plausibly arrives from another
+// system rather than off an aircraft, so nesting depth is bounded rather than
+// left to run the C stack out. Real manifests nest three or four deep.
+#define SJ_MAX_DEPTH 64
+
 typedef struct {
     const char *p;
     const char *end;
     int         line;
+    int         depth;
     char        err[160];
     bool        failed;
 } sj_t;
@@ -103,15 +109,29 @@ static bool sj_number(sj_t *j, double *out) {
 
 static void sj_skip_value(sj_t *j);
 
+// Every recursive descent goes through here. Bumping the counter on entry and
+// restoring it on exit means the guard covers the mutual recursion with
+// sj_skip_value as well as the hand-written object parsers below, which all
+// reach the nested case through this function.
+static bool sj_enter(sj_t *j) {
+    if (j->depth >= SJ_MAX_DEPTH) { sj_fail(j, "nested too deeply"); return false; }
+    j->depth++;
+    return true;
+}
+
+static void sj_leave(sj_t *j) { j->depth--; }
+
 static void sj_skip_container(sj_t *j, char open, char close) {
+    if (!sj_enter(j)) return;
     sj_expect(j, open);
-    if (sj_accept(j, close)) return;
+    if (sj_accept(j, close)) { sj_leave(j); return; }
     do {
-        if (j->failed) return;
+        if (j->failed) { sj_leave(j); return; }
         if (open == '{') { sj_string(j, NULL, 0); sj_expect(j, ':'); }
         sj_skip_value(j);
     } while (sj_accept(j, ','));
     sj_expect(j, close);
+    sj_leave(j);
 }
 
 static void sj_skip_value(sj_t *j) {
@@ -235,7 +255,7 @@ int skynet_manifest_load(skynet_manifest_t *m, const char *path,
     fclose(f);
     buf[size] = '\0';
 
-    sj_t j = { buf, buf + size, 1, {0}, false };
+    sj_t j = { buf, buf + size, 1, 0, {0}, false };
     sj_expect(&j, '{');
     if (!sj_accept(&j, '}')) {
         do {

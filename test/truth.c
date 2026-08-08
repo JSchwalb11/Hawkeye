@@ -104,7 +104,9 @@ int truth_writer_finish(truth_writer_t *w, const truth_header_t *h) {
     fprintf(f, "    \"live_nodes_max\": %lld,\n", (long long)t->live_nodes_max);
     fprintf(f, "    \"prune_blocks_min\": %lld,\n", (long long)t->prune_blocks_min);
     fprintf(f, "    \"vehicle0_rms_max\": %.9g,\n", t->vehicle0_rms_max);
-    fprintf(f, "    \"vehicle1_rms_min\": %.9g\n", t->vehicle1_rms_min);
+    fprintf(f, "    \"vehicle1_rms_min\": %.9g,\n", t->vehicle1_rms_min);
+    fprintf(f, "    \"group_false_free_max\": %.9g,\n", t->group_false_free_max);
+    fprintf(f, "    \"group_min_rays\": %d\n", t->group_min_rays);
     fprintf(f, "  }\n}\n");
 
     fclose(f);
@@ -270,6 +272,8 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         x->prune_blocks_min     = (int64_t)key_num(th, "prune_blocks_min", 0);
         x->vehicle0_rms_max     = key_num(th, "vehicle0_rms_max", 0.0);
         x->vehicle1_rms_min     = key_num(th, "vehicle1_rms_min", 0.0);
+        x->group_false_free_max = key_num(th, "group_false_free_max", 0.0);
+        x->group_min_rays       = (int)key_num(th, "group_min_rays", 0);
     }
     free(buf);
 

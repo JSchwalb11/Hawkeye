@@ -137,6 +137,11 @@ void map_session_feed_event(map_session_t *ms, int slot, int64_t t_ns,
 // step. Call once per frame with the wall-clock delta.
 void map_session_tick(map_session_t *ms, float dt_s);
 
+// The same work, but with the playhead set from outside instead of advanced
+// by dt_s. Replay uses this so the transport stays the single authority on
+// "now" without the map growing a second, divergent code path.
+void map_session_tick_at(map_session_t *ms, int64_t want_ns, float dt_s);
+
 // Bring the map into agreement with the playhead after a scrub.
 uint32_t map_session_resync(map_session_t *ms);
 

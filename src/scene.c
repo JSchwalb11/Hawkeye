@@ -567,7 +567,8 @@ void scene_handle_input(scene_t *s) {
     }
 
     // Mouse drag to orbit/look (left button, perspective only)
-    if (s->ortho_mode == ORTHO_NONE && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+    if (s->ortho_mode == ORTHO_NONE && !s->ui_pointer_captured &&
+        IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         Vector2 delta = GetMouseDelta();
         if (s->cam_mode == CAM_MODE_CHASE) {
             s->chase_yaw   -= delta.x * 0.005f;
@@ -584,7 +585,7 @@ void scene_handle_input(scene_t *s) {
     }
 
     // Click drag to pan in ortho mode (left or right button)
-    if (s->ortho_mode != ORTHO_NONE &&
+    if (s->ortho_mode != ORTHO_NONE && !s->ui_pointer_captured &&
         (IsMouseButtonDown(MOUSE_BUTTON_LEFT) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT))) {
         Vector2 delta = GetMouseDelta();
         // Convert pixel delta to world units based on ortho span and screen size

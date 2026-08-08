@@ -32,9 +32,16 @@ void map_hud_defaults(map_hud_opts_t *o);
 int map_hud_draw_panel(const map_session_t *ms, const map_render_t *mr,
                        int x, int y, int width, Font font, const theme_t *theme);
 
+// The timeline's pointer handling, split out from the drawing so it can run
+// before the camera sees the same mouse button. Call it once per frame with
+// the rectangle the widget will be drawn into, ahead of scene_handle_input;
+// it returns true when the pointer is over the widget, which is the caller's
+// cue to keep the camera's hands off it.
+bool map_hud_timeline_input(map_session_t *ms, int x, int y, int width, int height);
+
 // The replay timeline: playhead, keyframes, event marks and the live pin.
-// Returns true when the pointer interacted with it this frame.
-bool map_hud_draw_timeline(map_session_t *ms, int x, int y, int width, int height,
+// Drawing only -- map_hud_timeline_input does the interacting.
+void map_hud_draw_timeline(map_session_t *ms, int x, int y, int width, int height,
                            Font font, const theme_t *theme);
 
 // One-line summary for the corner of a crowded screen.

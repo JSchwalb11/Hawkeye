@@ -271,11 +271,7 @@ void map_session_feed_obstacle(map_session_t *ms, int slot, int64_t t_ns,
 
 // ------------------------------------------------------------ per-frame
 
-void map_session_tick(map_session_t *ms, float dt_s) {
-    if (!ms) return;
-
-    timeline_advance(&ms->timeline, dt_s);
-
+static void tick_playhead(map_session_t *ms, float dt_s) {
     if (ms->timeline.playhead.pinned_to_head) {
         // Coming back to live after a scrub, the map is still showing the past.
         // Rebuild it to the head before resuming incremental insertion --
@@ -303,6 +299,32 @@ void map_session_tick(map_session_t *ms, float dt_s) {
         map_ingest_discard_all(&ms->ingest);
         timeline_sync_map(&ms->timeline, &ms->map);
     }
+}
+
+void map_session_tick(map_session_t *ms, float dt_s) {
+    if (!ms) return;
+    timeline_advance(&ms->timeline, dt_s);
+    tick_playhead(ms, dt_s);
+}
+
+void map_session_tick_at(map_session_t *ms, int64_t want_ns, float dt_s) {
+    if (!ms) return;
+
+    // Replay: the transport owns the playhead, so it is set here rather than
+    // advanced. Everything after that is the same code the live path runs --
+    // which is the point, and is how replay gets keyframes and the
+    // don't-insert-while-scrubbed rule for free.
+    if (!ms->timeline.have_span) return;
+    if (want_ns >= ms->timeline.head_ns) {
+        // The transport is at the frontier of what has been fed. That is
+        // exactly what "live" means here, whatever the wall clock says.
+        if (!ms->timeline.playhead.pinned_to_head) timeline_pin_live(&ms->timeline);
+        else ms->timeline.playhead.t_ns = ms->timeline.head_ns;
+    } else if (want_ns != ms->timeline.playhead.t_ns) {
+        timeline_set_playhead(&ms->timeline, want_ns);
+    }
+
+    tick_playhead(ms, dt_s);
 }
 
 uint32_t map_session_resync(map_session_t *ms) {

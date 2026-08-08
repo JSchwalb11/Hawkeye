@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#define OB_ORIENTATION_COUNT 40
+#define OB_ORIENTATION_COUNT 41
 
 // R_body<-sensor as a row-major 3x3 matrix. Returns false for out-of-range
 // values, leaving `m` as the identity.
