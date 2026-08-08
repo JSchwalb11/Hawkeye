@@ -144,15 +144,21 @@ int df_reader_next(df_reader_t *r, df_record_t *out) {
         }
         if (r->pos + fmt->length > r->len) return 0;
 
+        // Take the length now. A FMT record can describe FMT itself, and
+        // register_format writes straight into r->formats[type] -- the same
+        // struct `fmt` points at. Advancing by fmt->length afterwards would
+        // step by the length the log just declared rather than the one this
+        // record was actually validated against, and desynchronise the stream.
+        const uint8_t rec_len = fmt->length;
         const uint8_t *payload = r->data + r->pos + 3;
-        const size_t payload_len = (size_t)fmt->length - 3;
+        const size_t payload_len = (size_t)rec_len - 3;
 
         if (type == DF_FMT_TYPE && payload_len >= 86) register_format(r, payload);
 
         out->fmt = &r->formats[type];
         out->payload = payload;
         out->payload_len = payload_len;
-        r->pos += fmt->length;
+        r->pos += rec_len;
         r->records++;
         return 1;
     }
@@ -231,6 +237,12 @@ bool df_field_string(const df_record_t *rec, const char *label, char *out, size_
 bool df_record_time_ns(const df_record_t *rec, int64_t *out_ns) {
     int64_t us = 0;
     if (!df_field_int(rec, "TimeUS", &us)) return false;
+    // TimeUS is boot-relative microseconds read straight out of the log. A
+    // corrupt or misaligned field can hand back anything a 64-bit integer
+    // holds, and multiplying that by 1000 overflows into a negative timestamp
+    // that then sets the timeline's span. Around 292 years of uptime is where
+    // the honest range ends.
+    if (us < 0 || us > INT64_MAX / 1000LL) return false;
     if (out_ns) *out_ns = us * 1000LL;
     return true;
 }

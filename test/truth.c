@@ -99,6 +99,7 @@ int truth_writer_finish(truth_writer_t *w, const truth_header_t *h) {
     fprintf(f, "    \"require_drops\": %d,\n", t->require_drops);
     fprintf(f, "    \"contested_max_dist_m\": %.9g,\n", t->contested_max_dist_m);
     fprintf(f, "    \"require_contested\": %d,\n", t->require_contested);
+    fprintf(f, "    \"contested_share_max\": %.9g,\n", t->contested_share_max);
     fprintf(f, "    \"cone_ratio_min\": %.9g,\n", t->cone_ratio_min);
     fprintf(f, "    \"weak_ratio_min\": %.9g,\n", t->weak_ratio_min);
     fprintf(f, "    \"live_nodes_max\": %lld,\n", (long long)t->live_nodes_max);
@@ -209,7 +210,10 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
     if (p) {
         while ((p = strstr(p, "\"sysid\"")) != NULL && h->vehicle_count < TRUTH_MAX_VEHICLES) {
             truth_vehicle_t *v = &h->vehicles[h->vehicle_count];
-            v->sysid = (uint8_t)num_after(p + 7, 1);
+            // p + 7 lands on the ':' that follows "sysid", and strtod stops
+            // dead on it -- so this used to return the fallback for every
+            // vehicle. find_key steps past the colon and the whitespace.
+            v->sysid = (uint8_t)num_after(find_key(p, "sysid"), 1);
             const char *org = strstr(p, "\"origin\"");
             if (org) {
                 v->origin_lat = num_after(find_key(org, "lat"), 0);
@@ -266,6 +270,7 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         x->require_drops        = (int)key_num(th, "require_drops", 0);
         x->contested_max_dist_m = key_num(th, "contested_max_dist_m", 0.0);
         x->require_contested    = (int)key_num(th, "require_contested", 0);
+        x->contested_share_max  = key_num(th, "contested_share_max", 0.0);
         x->cone_ratio_min       = key_num(th, "cone_ratio_min", 0.0);
         x->weak_ratio_min       = key_num(th, "weak_ratio_min", 0.0);
         x->live_nodes_max       = (int64_t)key_num(th, "live_nodes_max", 0);

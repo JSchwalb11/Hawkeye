@@ -55,6 +55,10 @@ typedef struct {
     int     require_drops;         // 1 = drops must be non-zero and reported
     double  contested_max_dist_m;  // contested cells must sit within this of the offset band
     int     require_contested;     // 1 = contested cells must exist
+    // Divergence flagged *everywhere* is as useless as divergence flagged
+    // nowhere, and a floor alone cannot tell the two apart. Expressed as a
+    // share of occupied cells so it survives a change of fixture scale.
+    double  contested_share_max;   // 0 = unchecked
     double  cone_ratio_min;        // mean occupied cell size, wide FOV / narrow FOV
     double  weak_ratio_min;        // mean |log-odds|, clean / weak
     // Per-vehicle surface RMS bounds. The clock fixture uses both: vehicle 0

@@ -51,7 +51,7 @@ static const ob_entry_t k_table[OB_ORIENTATION_COUNT] = {
     /* 35 */ { 270, 270,   0,   "ROTATION_ROLL_270_PITCH_270" },
     /* 36 */ {  90, 180,  90,   "ROTATION_ROLL_90_PITCH_180_YAW_90" },
     /* 37 */ {  90,   0, 270,   "ROTATION_ROLL_90_YAW_270" },
-    /* 38 */ {  90,  68, 293,   "ROTATION_ROLL_90_PITCH_68_YAW_293" },
+    /* 38 */ {  90,  68.8, 293.3, "ROTATION_ROLL_90_PITCH_68_YAW_293" },
     /* 39 */ {   0, 315,   0,   "ROTATION_PITCH_315" },
     /* 40 */ {  90, 315,   0,   "ROTATION_ROLL_90_PITCH_315" },
 };

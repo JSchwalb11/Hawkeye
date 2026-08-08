@@ -128,6 +128,7 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .surface_rms_max_m = 2.00, .false_occupied_max = 0.85, .false_free_max = 0.75,
         .coverage_min = 0.95, .occupied_cells_min = 50, .occupied_cells_max = -1,
         .require_contested = 1, .contested_max_dist_m = 4.0,
+        .contested_share_max = 0.60,
     }, 0, 0, 0 },
 
     [FX_VANISHING] = { "vanishing", 75.0, 1, 10.0, SENSOR_DISTANCE, 1, {
@@ -882,6 +883,21 @@ static int run(sim_t *s, uint32_t seed, double scale) {
     h.budget_per_drain = s->def->budget_per_drain;
     h.map_byte_cap = (size_t)512 * 1024 * 1024;
     h.thresholds = s->def->th;
+
+    // The load-dependent thresholds have to follow the load. `firehose` is the
+    // one fixture whose vehicle count is a knob, and it is documented as a way
+    // to trim CI cost -- but its throughput floor and its "drops must happen"
+    // assertion are properties of eight vehicles. Turning the knob down used to
+    // fail the fixture for doing exactly what it was asked.
+    if (s->def->vehicles > 0 && s->vehicles != s->def->vehicles) {
+        const double load = (double)s->vehicles / (double)s->def->vehicles;
+        h.thresholds.min_rays_per_s *= load;
+        h.thresholds.occupied_cells_min =
+            (int64_t)((double)h.thresholds.occupied_cells_min * load);
+        // Below the nominal fleet the queue may never overrun, and asserting a
+        // drop would be asserting something this run does not produce.
+        if (load < 1.0) h.thresholds.require_drops = 0;
+    }
 
     return truth_writer_finish(&s->truth, &h);
 }

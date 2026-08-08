@@ -415,6 +415,14 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
             bad += fail("contested spread (m)", r->contested_max_dist, ">",
                         th->contested_max_dist_m);
     }
+    if (th->contested_share_max > 0.0 && r->occupied_cells > 0) {
+        // A ceiling as well as a floor. Without one, a change that flagged
+        // every cell in the map as contested would sail through the fixture
+        // whose whole subject is divergence.
+        const double share = (double)r->contested_cells / (double)r->occupied_cells;
+        if (share > th->contested_share_max)
+            bad += fail("contested share", share, ">", th->contested_share_max);
+    }
 
     if (th->cone_ratio_min > 0.0 && r->cone_ratio < th->cone_ratio_min)
         bad += fail("cone size ratio", r->cone_ratio, "<", th->cone_ratio_min);

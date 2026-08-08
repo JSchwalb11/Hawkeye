@@ -58,7 +58,7 @@ void rt_ned_to_enu(const double ned[3], double enu[3]) {
 // aerospace order R = Rz(yaw) . Ry(pitch) . Rx(roll). Every one of these is a
 // chance to be wrong, which is why the `orientations` fixture sweeps all of
 // them against a single plane.
-typedef struct { int16_t roll, pitch; float yaw; const char *name; } rt_orient_t;
+typedef struct { float roll, pitch, yaw; const char *name; } rt_orient_t;
 
 static const rt_orient_t k_orientations[MAV_SENSOR_ORIENTATION_COUNT] = {
     {   0,   0,   0.0f, "NONE" },
@@ -99,7 +99,10 @@ static const rt_orient_t k_orientations[MAV_SENSOR_ORIENTATION_COUNT] = {
     { 270, 270,   0.0f, "ROLL_270_PITCH_270" },
     {  90, 180,  90.0f, "ROLL_90_PITCH_180_YAW_90" },
     {  90,   0, 270.0f, "ROLL_90_YAW_270" },
-    {  90,  68, 293.0f, "ROLL_90_PITCH_68_YAW_293" },
+    // The enum's own comment rounds this one to whole degrees, but the mount it
+    // names is ArduPilot's, and ArduPilot builds it from 68.8 and 293.3. At 30 m
+    // the rounding is 0.4 m of boresight error for no reason.
+    {  90,  68.8f, 293.3f, "ROLL_90_PITCH_68_YAW_293" },
     {   0, 315,   0.0f, "PITCH_315" },
     {  90, 315,   0.0f, "ROLL_90_PITCH_315" },
 };
@@ -110,8 +113,7 @@ bool rt_sensor_orientation_quat(uint8_t orientation, float q[4]) {
         return false;
     }
     const rt_orient_t *o = &k_orientations[orientation];
-    rt_quat_from_euler((float)o->roll * RT_DEG2RAD,
-                       (float)o->pitch * RT_DEG2RAD,
+    rt_quat_from_euler(o->roll * RT_DEG2RAD, o->pitch * RT_DEG2RAD,
                        o->yaw * RT_DEG2RAD, q);
     return true;
 }
@@ -159,8 +161,9 @@ bool rt_build_ray(const ray_obs_t *obs, om_ray_t *out) {
     if (!obs || !out) return false;
     if (!isfinite(obs->distance_m)) return false;
 
-    const float max_d = (obs->max_distance_m > 0.0f) ? obs->max_distance_m : obs->distance_m;
     const float min_d = obs->min_distance_m;
+    const bool have_max = (obs->max_distance_m > 0.0f);
+    const float max_d = have_max ? obs->max_distance_m : obs->distance_m;
 
     // Below min range the sensor is telling us about itself, not the world.
     if (obs->distance_m < min_d) return false;
@@ -169,9 +172,14 @@ bool rt_build_ray(const ray_obs_t *obs, om_ray_t *out) {
     // At (or beyond) max range there is no return. Carve out to max range and
     // mark nothing occupied -- this is the difference between a map and a
     // cylinder of phantom walls at sensor range.
+    //
+    // A sender that leaves max_distance unset is saying it does not know its
+    // own range, not that every reading is at it. Substituting the reading for
+    // the ceiling and then comparing the two would turn every such return into
+    // a no-return and the map would never hold a surface at all.
     bool hit = true;
     float range = obs->distance_m;
-    if (range >= max_d) { hit = false; range = max_d; }
+    if (have_max && range >= max_d) { hit = false; range = max_d; }
 
     float q_bs[4];
     if (obs->have_quaternion) {

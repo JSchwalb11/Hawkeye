@@ -734,6 +734,26 @@ void octomap_iterate_chunk(const octomap_t *m, int64_t chunk_key,
         half = quarter;
         depth++;
     }
+
+    if (depth < m->chunk_depth) {
+        // The descent ran into a leaf coarser than a chunk. Reporting it at its
+        // own size would hand the same cell to every chunk it spans -- each of
+        // which then extracts and draws the whole thing, so a single 16 m free
+        // block is drawn dozens of times and each copy overhangs its chunk's
+        // bounds. Report the chunk's own share of it instead.
+        om_leaf_t leaf;
+        memset(&leaf, 0, sizeof(leaf));
+        leaf.node = &m->nodes[idx];
+        leaf.center[0] = center[0];
+        leaf.center[1] = center[1];
+        leaf.center[2] = center[2];
+        leaf.size = size;
+        leaf.depth = m->chunk_depth;
+        leaf.state = om_node_state(m, &m->nodes[idx]);
+        fn(&leaf, user);
+        return;
+    }
+
     iterate_rec(m, idx, depth, cx, cy, cz, half, fn, user);
 }
 
