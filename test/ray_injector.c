@@ -35,6 +35,7 @@
 #include "geom.h"
 #include "orientation_basis.h"
 #include "splat.h"
+#include "trimesh.h"
 #include "tlog.h"
 #include "truth.h"
 
@@ -58,7 +59,7 @@ typedef enum {
     FX_EMPTY = 0, FX_GROUND, FX_WALL, FX_CORRIDOR, FX_ORIENTATIONS, FX_MOVING,
     FX_TWO_ORIGINS, FX_DISAGREEMENT, FX_VANISHING, FX_CONE, FX_WEAK,
     FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_COOPERATIVE,
-    FX_STATUE_SOLO, FX_STATUE_FLEET, FX_COUNT
+    FX_STATUE_SOLO, FX_STATUE_FLEET, FX_STATUE_PRECISION, FX_COUNT
 } fixture_id_t;
 
 typedef enum { SENSOR_DISTANCE, SENSOR_OBSTACLE } sensor_kind_t;
@@ -196,8 +197,8 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     [FX_STATUE_SOLO] = { "statue-solo", 120.0, 1, 10.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 1.20, .false_occupied_max = 0.35, .false_free_max = 0.15,
         .coverage_min = 0.80, .occupied_cells_min = 3000, .occupied_cells_max = -1,
-        .shape_iou_min = 0.40, .shape_recall_min = 0.75,
-        .shape_precision_min = 0.60, .shape_voxel_m = 1.0,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.80,
+        .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
     }, 0, 0, 2, true },
 
     // Fleet: four drones, each pinned to its own 90-degree sector and its own
@@ -207,10 +208,51 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     [FX_STATUE_FLEET] = { "statue-fleet", 60.0, 4, 10.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 1.20, .false_occupied_max = 0.35, .false_free_max = 0.15,
         .coverage_min = 0.80, .occupied_cells_min = 4000, .occupied_cells_max = -1,
-        .shape_iou_min = 0.40, .shape_recall_min = 0.75,
-        .shape_precision_min = 0.60, .shape_voxel_m = 1.0,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.85,
+        .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
         .merged_surface_min = 0.90, .solo_surface_max = 0.60,
     }, 0, 0, 4, true },
+
+    // Centimetres, not decimetres. Everything in the chain has to come down
+    // together, and the chain is short: beam footprint, then map resolution,
+    // then the reference you score against.
+    //
+    //   beam      72 sectors of 0.09 degrees, so 0.6 cm across at 8 m
+    //   standoff  ~8 m instead of 34, because footprint scales with range
+    //   leaf      7.8 mm under a 256 m root at depth 15
+    //   scorer    exact point-triangle distance, not the 34 cm splat spacing
+    //
+    // Pose is exact here, which is the one term a fixture cannot supply and a
+    // real flight must: at this tolerance RTK and a short standoff are not
+    // optional, and the thresholds below say nothing about achieving them.
+    [FX_STATUE_PRECISION] = { "statue-precision", 60.0, 1, 20.0, SENSOR_OBSTACLE, 1, {
+        // One centimetre, asserted. The run measures 0.9 mm, so the threshold
+        // has room -- but it is set at the figure that means something rather
+        // than at the figure that happens to come out, and it is an order of
+        // magnitude below anything the decimetre fixtures can claim.
+        .surface_rms_max_m = 0.01, .false_occupied_max = 0.05,
+        // The tolerance here is a single 7.8 mm leaf, a far tighter question
+        // than the same rate asks of a 0.25 m map. Cells sitting two leaves
+        // away still score 0.9 mm RMS and zero false-occupied, so this rate is
+        // measuring quantisation rather than loss.
+        // What this fixture asserts is *accuracy*: where the map puts a cell,
+        // that cell is 0.8 mm from the true surface and never off it.
+        //
+        // Completeness at this resolution is a different question and the
+        // answer is worse: about half the observed surface points have no cell
+        // within 2 cm. That is not quantisation -- widening the tolerance from
+        // one leaf to 2 cm moved it by two points -- it is erosion. At 7.8 mm a
+        // ray grazing the surface carves cells a neighbouring ray marked, and
+        // occupied cells end up at mean |log-odds| 18 against a threshold of
+        // 14, barely holding on. Binary occupancy has no way to represent
+        // "the surface passes through here, at this offset"; a surfel centroid
+        // or a TSDF does, and that is the next step rather than part of this
+        // one. The bound below is set where it would catch a collapse without
+        // pretending the current figure is good.
+        .false_free_max = 0.60, .surface_tol_m = 0.02,
+        .coverage_min = 0.90, .occupied_cells_min = 5000, .occupied_cells_max = -1,
+        .shape_voxel_m = 0.05,
+    }, 0, 0, 8, true },
 
     [FX_ENDURANCE] = { "endurance", 1920.0, 2, 4.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 0.80, .false_occupied_max = 0.20, .false_free_max = 0.10,
@@ -257,6 +299,17 @@ static int orientation_step(double t) { return (int)(t / ORIENT_STEP_S); }
 // close enough that a 1.7-degree sector is a 1 m cone at the far side.
 #define STATUE_STANDOFF_M 34.0
 #define STATUE_EYE_M      40.0
+
+// The precision fixture works the head and shoulders from close in.
+#define STATUE_PRECISION_R  9.0
+#define STATUE_BAND_MID    70.0
+// A narrow band, deliberately. At 7.8 mm leaves the free space inside
+// refine_dist of every endpoint is what consumes the node budget, not the
+// surface -- so a centimetre fixture buys its resolution by mapping a small
+// volume well rather than a large one badly. Widening this to 7 m puts the map
+// on its byte cap, where pruning fires on every drain and walks the whole tree:
+// the same run goes from 3.5 s to over five minutes.
+#define STATUE_BAND_HALF    2.5
 
 #define ORIENT_GRID_COLS 7
 #define ORIENT_PLOT_M    8.0
@@ -462,6 +515,20 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
         // one altitude. Nothing about the message changes -- the frame is still
         // BODY_FRD and the viewer resolves it through attitude, which is
         // precisely the path this exercises.
+        case FX_STATUE_PRECISION: {
+            // Two slow orbits of the head and shoulders while bobbing through
+            // the band, so a fan only 6.5 degrees wide still paints it. Close
+            // in: the footprint is the range times the sector angle, and no
+            // amount of map resolution buys back a metre-wide beam.
+            const double u = t / 60.0;
+            const double ang = u * 2.0 * M_PI;      // one orbit
+            p->enu[0] += STATUE_PRECISION_R * cos(ang);
+            p->enu[1] += STATUE_PRECISION_R * sin(ang);
+            p->enu[2] = STATUE_BAND_MID + STATUE_BAND_HALF * sin(t * (2.0 * M_PI / 7.0));
+            p->yaw = ang + M_PI;
+            break;
+        }
+
         case FX_STATUE_SOLO: {
             // Four orbits while climbing from below the pedestal to above the
             // torch. One orbit at one altitude leaves the base and the crown
@@ -633,7 +700,9 @@ typedef struct {
     const fixture_def_t *def;
     geom_scene_t  scene;
     splat_cloud_t cloud;          // the world, when the fixture uses a splat
+    trimesh_t     mesh;           // the exact surface, when one was supplied
     char          splat_path[384];
+    char          mesh_path[384];
     geo_origin_t  session;
     geo_origin_t  vehicle_origin[MAX_SIM_VEHICLES];
     double        vehicle_origin_lla[MAX_SIM_VEHICLES][3];
@@ -774,6 +843,13 @@ static void sensor_axis_enu(const sim_pose_t *p, const sensor_cfg_t *c,
 // every emitter has to know about.
 static bool sim_raycast(const sim_t *s, double t, const double origin[3],
                         const double dir[3], double max_m, double *t_hit) {
+    // The precision fixture ranges against the triangles, not the Gaussians. A
+    // splat's apparent depth shifts with incidence by roughly its spacing, so
+    // ranging against the cloud puts a ~10 cm floor under the measurable error
+    // however narrow the beam -- measured: 9.65 cm RMS with a 0.6 cm footprint.
+    // That floor is the representation's, not the world's.
+    if (s->fx == FX_STATUE_PRECISION && s->mesh.count)
+        return trimesh_raycast(&s->mesh, origin, dir, max_m, t_hit);
     if (s->def->splat_world) {
         if (!s->cloud.count) return false;
         return splat_raycast(&s->cloud, origin, dir, max_m, t_hit);
@@ -891,9 +967,13 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
     // message with a different increment, which is the whole point of
     // increment_f being a float.
     const bool statue = s->def->splat_world;
-    const float increment = statue ? 1.7f : (360.0f / (float)sectors);
-    const float angle_offset = statue ? -61.0f : 0.0f;
-    const uint16_t min_cm = 20, max_cm = statue ? 9000 : 3000;
+    const bool precise = (s->fx == FX_STATUE_PRECISION);
+    // A 0.09-degree sector is 0.6 cm across at 8 m. That is the whole reason
+    // this fixture can be asked about centimetres and the others cannot.
+    const float increment = precise ? 0.09f : (statue ? 1.7f : (360.0f / (float)sectors));
+    const float angle_offset = precise ? -3.2f : (statue ? -61.0f : 0.0f);
+    const uint16_t min_cm = 20;
+    const uint16_t max_cm = precise ? 1600 : (statue ? 9000 : 3000);
     const double max_m = (double)max_cm * 0.01;
 
     uint16_t distances[OBSTACLE_DISTANCE_SECTORS];
@@ -1025,7 +1105,21 @@ static int run(sim_t *s, uint32_t seed, double scale) {
     h.root_size_m = 1024.0;
     h.max_depth = 12;          // 0.25 m leaves under a 1024 m root
     h.coarse_depth = 9;        // 2 m far-field carving
-    if (s->def->splat_world) {
+    if (s->fx == FX_STATUE_PRECISION) {
+        // Shrink the root rather than deepening the tree: a leaf is
+        // root / 2^depth, so a 256 m root reaches 7.8 mm at depth 15 where a
+        // 4096 m root would need depth 19 for the same cell. Depth costs
+        // traversal on every query; the root costs nothing.
+        h.root_size_m = 256.0;
+        h.max_depth = 15;      // 7.8 mm leaves
+        h.coarse_depth = 7;    // 2 m far-field carving
+        // Refine only right at the endpoint. The default 1.5 m of fine carving
+        // is 192 leaf cells per ray at this resolution, and the free space --
+        // which nobody is measuring -- would consume the entire node budget
+        // before the surface got any.
+        h.refine_dist_m = 0.25;
+        h.map_byte_cap = 512u << 20;
+    } else if (s->def->splat_world) {
         // A 1.7-degree sector at 35 m is a 1 m footprint. Running the map four
         // times finer than the sensor can resolve does not buy detail -- it
         // fragments the surface, because each pass places its evidence in a
@@ -1040,6 +1134,7 @@ static int run(sim_t *s, uint32_t seed, double scale) {
     h.budget_per_drain = s->def->budget_per_drain;
     h.map_byte_cap = (size_t)512 * 1024 * 1024;
     snprintf(h.splat_path, sizeof(h.splat_path), "%s", s->splat_path);
+    snprintf(h.mesh_path, sizeof(h.mesh_path), "%s", s->mesh_path);
     h.thresholds = s->def->th;
 
     // The load-dependent thresholds have to follow the load. `firehose` is the
@@ -1072,6 +1167,7 @@ static void usage(void) {
     printf("  --seed <n>         RNG seed (default 1)\n");
     printf("  --scale <f>        scale vehicle count and duration (default 1)\n");
     printf("  --splat <file>     Gaussian splat world (required by the statue fixtures)\n");
+    printf("  --mesh <file>      exact triangles for scoring, published to the truth\n");
     printf("  --list             print fixture names, one per line\n");
 }
 
@@ -1083,6 +1179,7 @@ int main(int argc, char **argv) {
     uint32_t seed = 1;
     double scale = 1.0;
     const char *splat_path = NULL;
+    const char *mesh_path = NULL;
     bool realtime = false;
 
     for (int i = 1; i < argc; i++) {
@@ -1094,6 +1191,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) scale = atof(argv[++i]);
         else if (strcmp(argv[i], "--splat") == 0 && i + 1 < argc) splat_path = argv[++i];
+        else if (strcmp(argv[i], "--mesh") == 0 && i + 1 < argc) mesh_path = argv[++i];
         else if (strcmp(argv[i], "--list") == 0) {
             for (int k = 0; k < FX_COUNT; k++) printf("%s\n", k_fixtures[k].name);
             return 0;
@@ -1135,6 +1233,14 @@ int main(int argc, char **argv) {
             return 2;
         }
         snprintf(s.splat_path, sizeof(s.splat_path), "%s", splat_path);
+        if (mesh_path) {
+            snprintf(s.mesh_path, sizeof(s.mesh_path), "%s", mesh_path);
+            if (trimesh_load(&s.mesh, mesh_path, err, sizeof(err)) != 0) {
+                fprintf(stderr, "mesh: %s\n", err);
+                return 2;
+            }
+            printf("exact surface: %u triangles\n", s.mesh.count);
+        }
         printf("splat world: %u gaussians, %.1f x %.1f x %.1f m\n", s.cloud.count,
                s.cloud.hi[0] - s.cloud.lo[0], s.cloud.hi[1] - s.cloud.lo[1],
                s.cloud.hi[2] - s.cloud.lo[2]);
@@ -1211,5 +1317,6 @@ int main(int argc, char **argv) {
            s.def->name, s.vehicles, s.duration_s,
            (unsigned long long)s.em.messages, s.truth.ray_count);
     splat_free(&s.cloud);
+    trimesh_free(&s.mesh);
     return rc;
 }

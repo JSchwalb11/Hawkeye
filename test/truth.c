@@ -56,15 +56,17 @@ int truth_writer_finish(truth_writer_t *w, const truth_header_t *h) {
             h->session_lat, h->session_lon, h->session_alt);
 
     fprintf(f, "  \"map\": {\"root_size_m\": %.9g, \"max_depth\": %d, \"coarse_depth\": %d, "
-               "\"skip_near_m\": %.9g, \"queue_capacity\": %u, \"budget_per_drain\": %u, "
+               "\"skip_near_m\": %.9g, \"refine_dist_m\": %.9g, "
+               "\"queue_capacity\": %u, \"budget_per_drain\": %u, "
                "\"byte_cap\": %llu},\n",
             h->root_size_m, h->max_depth, h->coarse_depth, h->skip_near_m,
-            h->queue_capacity, h->budget_per_drain, (unsigned long long)h->map_byte_cap);
+            h->refine_dist_m, h->queue_capacity, h->budget_per_drain,
+            (unsigned long long)h->map_byte_cap);
 
     if (h->splat_path[0]) {
         fprintf(f, "  \"splat\": {\"path\": \"%s\", ", h->splat_path);
         write_vec(f, "origin_enu", h->splat_origin_enu);
-        fprintf(f, "},\n");
+        fprintf(f, ", \"mesh\": \"%s\"},\n", h->mesh_path);
     }
 
     fprintf(f, "  \"vehicles\": [\n");
@@ -119,7 +121,8 @@ int truth_writer_finish(truth_writer_t *w, const truth_header_t *h) {
     fprintf(f, "    \"shape_iou_min\": %.9g,\n", t->shape_iou_min);
     fprintf(f, "    \"shape_recall_min\": %.9g,\n", t->shape_recall_min);
     fprintf(f, "    \"shape_precision_min\": %.9g,\n", t->shape_precision_min);
-    fprintf(f, "    \"shape_voxel_m\": %.9g\n", t->shape_voxel_m);
+    fprintf(f, "    \"shape_voxel_m\": %.9g,\n", t->shape_voxel_m);
+    fprintf(f, "    \"surface_tol_m\": %.9g\n", t->surface_tol_m);
     fprintf(f, "  }\n}\n");
 
     fclose(f);
@@ -212,6 +215,7 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         h->max_depth        = (int)key_num(mp, "max_depth", 0);
         h->coarse_depth     = (int)key_num(mp, "coarse_depth", 0);
         h->skip_near_m      = key_num(mp, "skip_near_m", 0);
+        h->refine_dist_m    = key_num(mp, "refine_dist_m", 0);
         h->queue_capacity   = (uint32_t)key_num(mp, "queue_capacity", 0);
         h->budget_per_drain = (uint32_t)key_num(mp, "budget_per_drain", 0);
         h->map_byte_cap     = (size_t)key_num(mp, "byte_cap", 0);
@@ -223,6 +227,7 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         if (sp) {
             key_str(sp, "path", h->splat_path, sizeof(h->splat_path));
             read_vec3(find_key(sp, "origin_enu"), h->splat_origin_enu);
+            key_str(sp, "mesh", h->mesh_path, sizeof(h->mesh_path));
         }
     }
 
@@ -306,6 +311,7 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         x->shape_recall_min     = key_num(th, "shape_recall_min", 0.0);
         x->shape_precision_min  = key_num(th, "shape_precision_min", 0.0);
         x->shape_voxel_m        = key_num(th, "shape_voxel_m", 0.0);
+        x->surface_tol_m        = key_num(th, "surface_tol_m", 0.0);
     }
     free(buf);
 

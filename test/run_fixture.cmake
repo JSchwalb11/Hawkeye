@@ -22,6 +22,9 @@ set(SPLAT_ARGS)
 if(DEFINED SPLAT AND NOT SPLAT STREQUAL "")
     set(SPLAT_ARGS --splat "${SPLAT}")
 endif()
+if(DEFINED MESH AND NOT MESH STREQUAL "")
+    list(APPEND SPLAT_ARGS --mesh "${MESH}")
+endif()
 
 execute_process(
     COMMAND "${INJECTOR}" --fixture "${FIXTURE}" --tlog "${TLOG}" --truth "${TRUTH}"

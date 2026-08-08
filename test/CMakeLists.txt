@@ -13,6 +13,7 @@ add_library(hawkeye-fixture-support STATIC
     canvas.c
     ortho_render.c
     splat.c
+    trimesh.c
 )
 target_include_directories(hawkeye-fixture-support PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(hawkeye-fixture-support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -58,11 +59,16 @@ set(HAWKEYE_FIXTURES
     cooperative
     statue-solo
     statue-fleet
+    statue-precision
 )
 
 # The statue fixtures range against a Gaussian splat rather than against
 # planes, so they need the asset. Everything else ignores it.
 set(STATUE_SPLAT ${CMAKE_SOURCE_DIR}/assets/statue_of_liberty.splat)
+# The exact triangles the splats were sampled from. A splat cloud cannot verify
+# a map to a finer tolerance than its own 34 cm splat spacing, so the precision
+# fixture ranges against these and scores against them.
+set(STATUE_MESH ${CMAKE_SOURCE_DIR}/assets/statue_of_liberty.tri)
 
 foreach(fixture ${HAWKEYE_FIXTURES})
     set(fixture_scale 1)
@@ -70,8 +76,10 @@ foreach(fixture ${HAWKEYE_FIXTURES})
         set(fixture_scale ${HAWKEYE_FIXTURE_FIREHOSE_SCALE})
     endif()
     set(fixture_splat "")
+    set(fixture_mesh "")
     if(fixture MATCHES "^statue-")
         set(fixture_splat ${STATUE_SPLAT})
+        set(fixture_mesh ${STATUE_MESH})
     endif()
     add_test(NAME fixture_${fixture}
         COMMAND ${CMAKE_COMMAND}
@@ -80,6 +88,7 @@ foreach(fixture ${HAWKEYE_FIXTURES})
             -DFIXTURE=${fixture}
             -DSCALE=${fixture_scale}
             -DSPLAT=${fixture_splat}
+            -DMESH=${fixture_mesh}
             -DWORKDIR=${FIXTURE_WORKDIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/run_fixture.cmake)
     set_tests_properties(fixture_${fixture} PROPERTIES TIMEOUT 600)

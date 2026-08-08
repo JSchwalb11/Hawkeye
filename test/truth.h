@@ -91,6 +91,11 @@ typedef struct {
     // own splat spacing and the sensor's cone footprint dominate, and a finer
     // lattice would measure those rather than the map's fidelity. 0 = leaf.
     double  shape_voxel_m;
+    // Physical tolerance for "is this surface point represented". Zero keeps
+    // the historical behaviour of one map leaf, which is resolution-relative
+    // and so asks a 7.8 mm map a hundred times harder a question than a 0.25 m
+    // one. A fixture chasing centimetres states the tolerance in metres.
+    double  surface_tol_m;
 } truth_thresholds_t;
 
 typedef struct {
@@ -118,6 +123,10 @@ typedef struct {
     // so the world the map is scored against is the world it was built from.
     char     splat_path[384];
     double   splat_origin_enu[3];
+    // The exact triangles the splats were sampled from. A splat cloud cannot
+    // verify a map to a finer tolerance than its own splat spacing, so
+    // centimetre fixtures score against these instead.
+    char     mesh_path[384];
 
     // Map configuration the checker must reproduce for the numbers to mean
     // anything.
@@ -125,6 +134,7 @@ typedef struct {
     int      max_depth;
     int      coarse_depth;
     double   skip_near_m;
+    double   refine_dist_m;   // 0 -> the octomap default
     uint32_t queue_capacity;
     uint32_t budget_per_drain;
     size_t   map_byte_cap;

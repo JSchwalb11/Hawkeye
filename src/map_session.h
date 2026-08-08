@@ -67,6 +67,7 @@ typedef struct {
     int      max_depth;
     int      coarse_depth;
     double   skip_near_m;
+    double   refine_dist_m;     // 0 -> octomap default
     uint32_t queue_capacity;
     uint32_t budget_per_drain;
     size_t   ray_log_bytes;

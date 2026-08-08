@@ -30,6 +30,7 @@ int map_session_init(map_session_t *ms, const map_session_config_t *cfg) {
     oc.max_depth = d.max_depth;
     oc.coarse_depth = d.coarse_depth;
     oc.skip_near_m = d.skip_near_m;
+    oc.refine_dist_m = d.refine_dist_m;
     if (octomap_init(&ms->map, &oc) != 0) return -1;
 
     map_ingest_config_t ic;

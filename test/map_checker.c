@@ -29,6 +29,7 @@
 #include "mavlink_map_decode.h"
 #include "canvas.h"
 #include "splat.h"
+#include "trimesh.h"
 #include "ortho_render.h"
 #include "tlog.h"
 #include "truth.h"
@@ -46,9 +47,16 @@
 typedef struct {
     const geom_scene_t  *scene;
     const splat_cloud_t *cloud;   // NULL unless the fixture ranged against one
+    const trimesh_t     *mesh;    // the exact surface, when one was published
 } world_t;
 
 static double world_distance(const world_t *w, double t_s, const double p[3]) {
+    // Prefer the exact triangles. The splat cloud is what the sensor sees and
+    // is the right world for ranging, but its own resolution is the splat
+    // spacing -- scoring against it puts a floor under the measurable error at
+    // roughly that figure, which is fine at decimetres and useless at
+    // centimetres.
+    if (w->mesh) return trimesh_distance(w->mesh, p);
     if (w->cloud) return splat_distance(w->cloud, p);
     return geom_scene_distance(w->scene, t_s, p);
 }
@@ -210,6 +218,7 @@ static void configure_session(map_session_t *ms, const truth_t *t) {
     cfg.max_depth = t->header.max_depth;
     cfg.coarse_depth = t->header.coarse_depth;
     cfg.skip_near_m = t->header.skip_near_m;
+    cfg.refine_dist_m = t->header.refine_dist_m;
     cfg.queue_capacity = t->header.queue_capacity;
     cfg.budget_per_drain = t->header.budget_per_drain;
     cfg.map_byte_cap = t->header.map_byte_cap;
@@ -289,6 +298,31 @@ static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *
     return 0;
 }
 
+typedef struct {
+    uint8_t     *lat;
+    const double *blo;
+    const int   *dim;
+    double       vox;
+} shape_mark_t;
+
+static void mark_map_leaf(const om_leaf_t *leaf, void *user) {
+    if (leaf->state != OM_OCCUPIED) return;
+    shape_mark_t *m = (shape_mark_t *)user;
+    const double h = leaf->size * 0.5;
+    int lo_i[3], hi_i[3];
+    for (int k = 0; k < 3; k++) {
+        lo_i[k] = (int)((leaf->center[k] - h - m->blo[k]) / m->vox);
+        hi_i[k] = (int)((leaf->center[k] + h - m->blo[k]) / m->vox);
+        if (hi_i[k] < 0 || lo_i[k] >= m->dim[k]) return;
+        if (lo_i[k] < 0) lo_i[k] = 0;
+        if (hi_i[k] >= m->dim[k]) hi_i[k] = m->dim[k] - 1;
+    }
+    for (int iz = lo_i[2]; iz <= hi_i[2]; iz++)
+    for (int iy = lo_i[1]; iy <= hi_i[1]; iy++)
+    for (int ix = lo_i[0]; ix <= hi_i[0]; ix++)
+        m->lat[((size_t)iz * m->dim[1] + iy) * m->dim[0] + ix] |= 0x04;   // LAT_MAP
+}
+
 static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
                     report_t *rep) {
     const world_t world = *w;
@@ -329,6 +363,14 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
     // False-free and coverage, both scored against the rays the injector says
     // it actually cast. Nothing is re-derived here.
     const double leaf = octomap_cell_size(&ms->map, ms->map.max_depth);
+    // The radius searched around a true surface point. One leaf by default,
+    // but a fixture may state a physical tolerance instead -- otherwise a finer
+    // map is asked a proportionally harder question and "did it keep the
+    // surface" stops being comparable between resolutions.
+    const double surf_tol = t->header.thresholds.surface_tol_m > 0.0
+        ? t->header.thresholds.surface_tol_m : leaf;
+    const int surf_steps = (int)(surf_tol / leaf + 0.5) > 1
+        ? (int)(surf_tol / leaf + 0.5) : 1;
     uint64_t surf_free = 0, surf_occ = 0;
     uint64_t swept = 0, observed = 0;
     // Per-group surface representation. Unlike the pooled false-free rate this
@@ -363,9 +405,9 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
                 // erosion; losing the surface entirely is what this measures.
                 bool represented = false, any_free = false;
                 uint32_t observers = 0;
-                for (int a = -1; a <= 1; a++)
-                for (int b = -1; b <= 1; b++)
-                for (int c = -1; c <= 1; c++) {
+                for (int a = -surf_steps; a <= surf_steps; a++)
+                for (int b = -surf_steps; b <= surf_steps; b++)
+                for (int c = -surf_steps; c <= surf_steps; c++) {
                     const double p[3] = { end[0] + a * leaf,
                                           end[1] + b * leaf,
                                           end[2] + c * leaf };
@@ -441,18 +483,18 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
             cells *= (size_t)dim[k];
         }
 
-        const double leaf_m = octomap_cell_size(&ms->map, ms->map.max_depth);
-        int sub = (int)(vox / leaf_m + 0.5);
-        if (sub < 1) sub = 1;
-        if (sub > 8) sub = 8;
-        const double step = vox / (double)sub;
-
         uint8_t *lat = (uint8_t *)calloc(cells, 1);
         if (lat) {
             #define LAT_WORLD    0x01
             #define LAT_OBSERVED 0x02
             #define LAT_MAP      0x04
             #define LAT_NEAR     0x08
+
+            // Everything below is driven by iteration over the things that
+            // exist -- splats, rays, occupied leaves -- rather than by
+            // sampling the lattice. Sampling costs cells x sub^3 queries,
+            // which at a 5 cm lattice over a 57 m box is 22 billion of them;
+            // iteration costs one pass over each set.
 
             // Which voxels an injector ray actually terminated in.
             for (uint32_t i = 0; i < t->ray_count; i++) {
@@ -465,31 +507,23 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
                 if (ok) lat[((size_t)c[2] * dim[1] + c[1]) * dim[0] + c[0]] |= LAT_OBSERVED;
             }
 
-            // Which voxels the world puts surface in, and which the map does.
-            for (int iz = 0; iz < dim[2]; iz++)
-            for (int iy = 0; iy < dim[1]; iy++)
-            for (int ix = 0; ix < dim[0]; ix++) {
-                const size_t g = ((size_t)iz * dim[1] + iy) * dim[0] + ix;
-                const double p[3] = { blo[0] + (ix + 0.5) * vox,
-                                      blo[1] + (iy + 0.5) * vox,
-                                      blo[2] + (iz + 0.5) * vox };
-                if (splat_cell_occupied(world.cloud, p, vox)) lat[g] |= LAT_WORLD;
-                // Sub-sample the map at its own leaf size. Asking only at the
-                // voxel centre would be asymmetric: the world side tests the
-                // whole cell, and the map's surface is a shell one leaf thick,
-                // so a centre-only test measures how often a thin shell passes
-                // through an exact point rather than whether the map holds the
-                // surface at all.
-                for (int sz = 0; sz < sub && !(lat[g] & LAT_MAP); sz++)
-                for (int sy = 0; sy < sub && !(lat[g] & LAT_MAP); sy++)
-                for (int sx = 0; sx < sub && !(lat[g] & LAT_MAP); sx++) {
-                    const double q[3] = {
-                        blo[0] + ix * vox + (sx + 0.5) * step,
-                        blo[1] + iy * vox + (sy + 0.5) * step,
-                        blo[2] + iz * vox + (sz + 0.5) * step };
-                    if (octomap_query(&ms->map, q[0], q[1], q[2]) == OM_OCCUPIED)
-                        lat[g] |= LAT_MAP;
+            // Where the world puts surface.
+            for (uint32_t i = 0; i < world.cloud->count; i++) {
+                int c[3]; bool ok = true;
+                for (int k = 0; k < 3; k++) {
+                    c[k] = (int)(((double)world.cloud->s[i].pos[k] - blo[k]) / vox);
+                    if (c[k] < 0 || c[k] >= dim[k]) ok = false;
                 }
+                if (ok) lat[((size_t)c[2] * dim[1] + c[1]) * dim[0] + c[0]] |= LAT_WORLD;
+            }
+
+            // Where the map does. An occupied cell marks every voxel it
+            // overlaps, so a cell coarser than the lattice is not undercounted
+            // and one finer is not lost -- the asymmetry a centre-only test
+            // introduces is exactly what made a thin shell vanish.
+            {
+                shape_mark_t mk = { lat, blo, dim, vox };
+                octomap_iterate(&ms->map, mark_map_leaf, &mk);
             }
 
             // A one-voxel dilation of the world, used only as precision's
@@ -840,7 +874,7 @@ static int run_listen(const truth_t *t, int port, double seconds,
 
     report_t rep;
     memset(&rep, 0, sizeof(rep));
-    const world_t wire_world = { &t->header.scene, NULL };
+    const world_t wire_world = { &t->header.scene, NULL, NULL };
     measure(&ms, t, &wire_world, &rep);
     printf("wire smoke: %llu frames, %llu occupied cells, surface RMS %.4f m\n",
            (unsigned long long)frames, (unsigned long long)rep.occupied_cells, rep.surface_rms);
@@ -1027,8 +1061,10 @@ int main(int argc, char **argv) {
     // The checker is not told where the surfaces are; it reads the same world
     // the injector did and re-derives nothing.
     splat_cloud_t cloud;
+    trimesh_t mesh;
     memset(&cloud, 0, sizeof(cloud));
-    world_t world = { &truth.header.scene, NULL };
+    memset(&mesh, 0, sizeof(mesh));
+    world_t world = { &truth.header.scene, NULL, NULL };
     if (truth.header.splat_path[0]) {
         if (splat_load(&cloud, truth.header.splat_path, err, sizeof(err)) != 0) {
             fprintf(stderr, "splat world: %s\n", err);
@@ -1037,6 +1073,18 @@ int main(int argc, char **argv) {
         }
         world.cloud = &cloud;
         printf("splat world: %u gaussians from %s\n", cloud.count, truth.header.splat_path);
+
+        if (truth.header.mesh_path[0]) {
+            if (trimesh_load(&mesh, truth.header.mesh_path, err, sizeof(err)) != 0) {
+                fprintf(stderr, "reference mesh: %s\n", err);
+                splat_free(&cloud);
+                truth_free(&truth);
+                return 1;
+            }
+            world.mesh = &mesh;
+            printf("exact surface: %u triangles from %s\n",
+                   mesh.count, truth.header.mesh_path);
+        }
     }
 
     map_session_t ms;
@@ -1047,6 +1095,7 @@ int main(int argc, char **argv) {
     if (replay_tlog(&ms, tlog_path, &truth, &rep) != 0) {
         map_session_free(&ms);
         splat_free(&cloud);
+        trimesh_free(&mesh);
         truth_free(&truth);
         return 1;
     }
@@ -1065,6 +1114,7 @@ int main(int argc, char **argv) {
 
     map_session_free(&ms);
     splat_free(&cloud);
+    trimesh_free(&mesh);
     truth_free(&truth);
     return bad ? 1 : 0;
 }

@@ -130,6 +130,8 @@ def main():
     ap.add_argument("--seed", type=int, default=20260808)
     ap.add_argument("--flatten", type=float, default=6.0,
                     help="ratio of tangential to normal Gaussian extent")
+    ap.add_argument("--tri", default=None,
+                    help="also write the placed triangles, for exact scoring")
     args = ap.parse_args()
 
     verts, faces = load_obj(args.obj)
@@ -192,6 +194,21 @@ def main():
             else:
                 hi_i = mid
         return tris[lo_i]
+
+    # The triangles the splats were sampled from, in the same placed frame.
+    # A splat cloud cannot verify a map to a finer tolerance than its own splat
+    # spacing; the triangles can, so centimetre work scores against these and
+    # keeps the splat only as what the *sensor* sees.
+    if args.tri:
+        t = open(args.tri, "wb")
+        t.write(b"HKTRI1\0\0")
+        t.write(struct.pack("<I", len(tris)))
+        t.write(struct.pack("<I", 0))
+        for (pa, pb, pc, _n, _a) in tris:
+            for p in (pa, pb, pc):
+                t.write(struct.pack("<3f", *p))
+        t.close()
+        print("%s: %d triangles" % (args.tri, len(tris)))
 
     out = open(args.out, "wb")
     for _ in range(args.count):
