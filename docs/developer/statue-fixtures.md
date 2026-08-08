@@ -83,18 +83,22 @@ dominate, and a finer lattice would be measuring those rather than the map.
   1.000 and then says nothing.
 - **whole-cloud coverage** — context, including surfaces no orbit can reach.
 
+All three figures are against the exact triangles, not the splat centres — see
+the precision section below for why that distinction has teeth.
+
 | | solo | fleet |
 | --- | --- | --- |
-| surface RMS | 0.279 m | 0.315 m |
-| false-occupied | 0.057 | 0.073 |
-| shape recall | 0.855 | 0.915 |
-| shape precision (strict / ±1 voxel) | 0.705 / 1.000 | 0.676 / 0.999 |
-| whole-cloud coverage | 0.633 | 0.769 |
-| merged surface | — | 0.915 |
-| best single drone alone | — | 0.344 |
+| surface RMS | 0.221 m | 0.268 m |
+| false-occupied | 0.035 | 0.056 |
+| shape recall | 0.899 | 0.950 |
+| shape precision (strict / ±1 voxel) | 0.584 / 0.997 | 0.568 / 0.996 |
+| whole-cloud coverage | 0.707 | 0.830 |
+| merged surface | — | 0.911 |
+| best single drone alone | — | 0.346 |
 
-The fleet reaches more of the statue in half the time, and no single drone
-accounts for more than a third of the observed surface. That is the cooperative
+The fleet reaches more of the statue in half the time (0.830 of the whole cloud
+against 0.707), and no single drone accounts for more than a third of the
+observed surface. That is the cooperative
 claim on a real object rather than on a box.
 
 ## Watching it happen
