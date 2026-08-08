@@ -96,6 +96,33 @@ static double get_wall_time(void) {
 #endif
 }
 
+int64_t mavlink_receiver_unix_ns(void) {
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    // FILETIME counts 100 ns ticks from 1601-01-01.
+    return (int64_t)((t - 116444736000000000ULL) * 100ULL);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+#endif
+}
+
+// Ask for a TIMESYNC round trip. The reply gives both a link latency number and
+// a time reference better than "assume boot-relative zero".
+static void request_timesync(mavlink_receiver_t *recv) {
+    if (!recv->sender_known) return;
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    mavlink_msg_timesync_pack(255, 0, &msg, 0, mavlink_receiver_unix_ns(),
+                              recv->sysid, 1);
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    sendto(recv->sockfd, (char *)buf, len, 0,
+           (struct sockaddr *)recv->sender_addr, sizeof(struct sockaddr_in));
+}
+
 static int set_nonblocking(sock_t s) {
 #ifdef _WIN32
     u_long mode = 1;
@@ -108,8 +135,12 @@ static int set_nonblocking(sock_t s) {
 
 int mavlink_receiver_init(mavlink_receiver_t *recv, uint16_t port, uint8_t channel) {
     bool debug = recv->debug;
+    void *frame_user = recv->frame_user;
+    void (*on_frame)(void *, const void *, const uint8_t *, uint16_t, int64_t) = recv->on_frame;
     memset(recv, 0, sizeof(*recv));
     recv->debug = debug;
+    recv->frame_user = frame_user;
+    recv->on_frame = on_frame;
     recv->port = port;
     recv->channel = channel;
     recv->sockfd = SOCK_INVALID;
@@ -168,8 +199,19 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
         mavlink_message_t msg;
         mavlink_status_t status;
 
+        size_t frame_start = 0;
         for (int i = 0; i < n; i++) {
             if (mavlink_parse_char(recv->channel, buf[i], &msg, &status)) {
+                if (recv->on_frame) {
+                    // Hand on the exact bytes as they arrived: a recorder that
+                    // re-encodes would quietly normalise away the framing the
+                    // viewer actually saw.
+                    const size_t frame_len = (size_t)i + 1 - frame_start;
+                    recv->on_frame(recv->frame_user, &msg, buf + frame_start,
+                                   (uint16_t)frame_len, mavlink_receiver_unix_ns());
+                }
+                frame_start = (size_t)i + 1;
+
                 if (recv->debug) {
                     printf("[MAVLink] msgid=%u sysid=%u compid=%u seq=%u len=%u\n",
                            msg.msgid, msg.sysid, msg.compid, msg.seq, msg.len);
@@ -281,6 +323,13 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
 
     if (got_data) {
         recv->last_msg_time = get_wall_time();
+        // One round trip a second is enough to hold a time reference and a
+        // latency number without adding meaningful uplink traffic.
+        const double now = recv->last_msg_time;
+        if (recv->connected && now - recv->last_timesync_s >= 1.0) {
+            recv->last_timesync_s = now;
+            request_timesync(recv);
+        }
     } else if (recv->connected && recv->last_msg_time > 0) {
         double now = get_wall_time();
         if (now - recv->last_msg_time > DISCONNECT_TIMEOUT_S) {
