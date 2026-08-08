@@ -596,6 +596,7 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
                 if (represented) { surf_occ++; grp_occ[ray->group]++; }
                 else if (any_free) surf_free++;
 
+
                 surface_total++;
                 if (represented) merged_hit++;
                 for (int v = 0; v < t->header.vehicle_count && v < TRUTH_MAX_VEHICLES; v++)

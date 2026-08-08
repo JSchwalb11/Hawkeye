@@ -195,9 +195,9 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     // Solo: one drone flies a full orbit and climbs, so it can see the whole
     // statue given time. Its map is expected to resemble the statue outright.
     [FX_STATUE_SOLO] = { "statue-solo", 120.0, 1, 10.0, SENSOR_OBSTACLE, 1, {
-        .surface_rms_max_m = 1.20, .false_occupied_max = 0.35, .false_free_max = 0.15,
+        .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.15,
         .coverage_min = 0.80, .occupied_cells_min = 3000, .occupied_cells_max = -1,
-        .shape_iou_min = 0.40, .shape_recall_min = 0.80,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.90,
         .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
     }, 0, 0, 2, true },
 
@@ -206,11 +206,11 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     // back. The merged map must resemble the statue and no single drone's
     // contribution may.
     [FX_STATUE_FLEET] = { "statue-fleet", 60.0, 4, 10.0, SENSOR_OBSTACLE, 1, {
-        .surface_rms_max_m = 1.20, .false_occupied_max = 0.35, .false_free_max = 0.15,
+        .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.15,
         .coverage_min = 0.80, .occupied_cells_min = 4000, .occupied_cells_max = -1,
-        .shape_iou_min = 0.40, .shape_recall_min = 0.85,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.90,
         .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
-        .merged_surface_min = 0.90, .solo_surface_max = 0.60,
+        .merged_surface_min = 0.95, .solo_surface_max = 0.60,
     }, 0, 0, 4, true },
 
     // Centimetres, not decimetres. Everything in the chain has to come down
@@ -236,20 +236,25 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         // away still score 0.9 mm RMS and zero false-occupied, so this rate is
         // measuring quantisation rather than loss.
         // What this fixture asserts is *accuracy*: where the map puts a cell,
-        // that cell is 0.8 mm from the true surface and never off it.
+        // that cell is 0.9 mm from the true surface and never off it.
         //
-        // Completeness at this resolution is a different question and the
-        // answer is worse: about half the observed surface points have no cell
-        // within 2 cm. That is not quantisation -- widening the tolerance from
-        // one leaf to 2 cm moved it by two points -- it is erosion. At 7.8 mm a
-        // ray grazing the surface carves cells a neighbouring ray marked, and
-        // occupied cells end up at mean |log-odds| 18 against a threshold of
-        // 14, barely holding on. Binary occupancy has no way to represent
-        // "the surface passes through here, at this offset"; a surfel centroid
-        // or a TSDF does, and that is the next step rather than part of this
-        // one. The bound below is set where it would catch a collapse without
-        // pretending the current figure is good.
-        .false_free_max = 0.60, .surface_tol_m = 0.02,
+        // Completeness is a separate question and comes out worse -- about a
+        // third of observed surface points have no cell within 2 cm. That is
+        // erosion, and it was measured rather than assumed: holding a cell at
+        // or above the occupancy threshold once it gets there changes the rate
+        // by 0.001, and a 2-5 cm truncation band on each ray's own endpoint
+        // changes it by 0.002, but making a cell that has *ever* been hit
+        // immune to free evidence takes it from 0.317 to 0.185. The order is
+        // what matters: misses arrive in bulk and often before the hit, so the
+        // cell is buried before it was ever occupied and no
+        // protect-what-is-occupied rule can see it.
+        //
+        // The fix is not a sticky flag -- that would stop the map ever clearing
+        // a removed obstacle, which `vanishing` exists to catch. It is a
+        // truncation band around observed surface, which is what a TSDF gives
+        // for free and which clears properly because the band moves with the
+        // evidence. Not part of this change.
+        .false_free_max = 0.40, .surface_tol_m = 0.02,
         .coverage_min = 0.90, .occupied_cells_min = 5000, .occupied_cells_max = -1,
         .shape_voxel_m = 0.05,
     }, 0, 0, 8, true },
@@ -301,6 +306,14 @@ static int orientation_step(double t) { return (int)(t / ORIENT_STEP_S); }
 #define STATUE_EYE_M      40.0
 
 // The precision fixture works the head and shoulders from close in.
+// The orbit angle runs from east, counter-clockwise, in the ENU plane. Yaw is a
+// compass heading -- from north, clockwise -- so facing the axis from angle `a`
+// is a heading of 270 - a degrees. Writing `a + pi` instead points the nose
+// somewhere else entirely, and a narrow fan then spends most of its sectors on
+// empty sky: the precision fixture was returning 18% hits where the geometry
+// supports 100%.
+#define STATUE_FACING_YAW(a) (-M_PI * 0.5 - (a))
+
 #define STATUE_PRECISION_R  9.0
 #define STATUE_BAND_MID    70.0
 // A narrow band, deliberately. At 7.8 mm leaves the free space inside
@@ -525,7 +538,7 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             p->enu[0] += STATUE_PRECISION_R * cos(ang);
             p->enu[1] += STATUE_PRECISION_R * sin(ang);
             p->enu[2] = STATUE_BAND_MID + STATUE_BAND_HALF * sin(t * (2.0 * M_PI / 7.0));
-            p->yaw = ang + M_PI;
+            p->yaw = STATUE_FACING_YAW(ang);
             break;
         }
 
@@ -540,7 +553,7 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             p->enu[1] += STATUE_STANDOFF_M * sin(ang);
             p->enu[2] = 10.0 + 72.0 * u;
             p->roll = M_PI * 0.5;
-            p->yaw = ang + M_PI;                        // nose at the statue
+            p->yaw = STATUE_FACING_YAW(ang);            // nose at the statue
             break;
         }
 
@@ -559,7 +572,7 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             p->enu[1] += STATUE_STANDOFF_M * sin(ang);
             p->enu[2] = 10.0 + 72.0 * u;
             p->roll = M_PI * 0.5;
-            p->yaw = ang + M_PI;
+            p->yaw = STATUE_FACING_YAW(ang);
             break;
         }
 

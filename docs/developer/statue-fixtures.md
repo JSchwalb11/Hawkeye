@@ -88,17 +88,16 @@ the precision section below for why that distinction has teeth.
 
 | | solo | fleet |
 | --- | --- | --- |
-| surface RMS | 0.221 m | 0.268 m |
-| false-occupied | 0.035 | 0.056 |
-| shape recall | 0.899 | 0.950 |
-| shape precision (strict / ±1 voxel) | 0.584 / 0.997 | 0.568 / 0.996 |
-| whole-cloud coverage | 0.707 | 0.830 |
-| merged surface | — | 0.911 |
-| best single drone alone | — | 0.346 |
+| surface RMS | 0.176 m | 0.135 m |
+| false-occupied | 0.023 | 0.013 |
+| shape recall | 0.976 | 0.989 |
+| shape precision (strict / ±1 voxel) | 0.552 / 0.999 | 0.554 / 0.999 |
+| whole-cloud coverage | 0.855 | 0.879 |
+| merged surface | — | 0.988 |
+| best single drone alone | — | 0.365 |
 
-The fleet reaches more of the statue in half the time (0.830 of the whole cloud
-against 0.707), and no single drone accounts for more than a third of the
-observed surface. That is the cooperative
+The fleet reaches more of the statue in half the time, and no single drone
+accounts for more than 37% of the observed surface. That is the cooperative
 claim on a real object rather than on a box.
 
 ## Watching it happen
@@ -168,19 +167,36 @@ Eight tenths of a millimetre, against an exact reference.
 
 ### What it does not achieve, and why
 
-Completeness at that resolution is worse: about half the observed surface
-points have no occupied cell within 2 cm. That is not quantisation — widening
-the tolerance from one leaf to 2 cm moved it by two points. It is **erosion**.
-At 7.8 mm a ray grazing the surface carves cells a neighbouring ray marked, and
-occupied cells end up at mean |log-odds| 18 against a threshold of 14, barely
-holding on.
+Completeness is a separate question and comes out worse: about a third of
+observed surface points have no occupied cell within 2 cm. The cause was
+measured rather than asserted, because the obvious explanation turned out to be
+only half right.
 
-Binary occupancy has no way to say "the surface passes through this cell, at
-this offset". A surfel centroid (a running mean of hit endpoints per leaf) or a
-TSDF (signed distance and weight, with the surface at the interpolated zero
-crossing) does, and a 5 cm TSDF resolves a surface to roughly voxel/10 at 1/125
-the cell count of a 1 cm binary grid. That is the next step and is not in this
-change.
+| change | false-free |
+| --- | --- |
+| baseline | 0.317 |
+| hold a cell at the occupancy threshold once it reaches it | 0.316 |
+| stop each ray's carve 2 cm short of its own endpoint | 0.316 |
+| ...5 cm short | 0.314 |
+| **a cell that has *ever* been hit is immune to free evidence** | **0.185** |
+
+The first three do nothing. The last halves the gap, and the difference between
+it and the first is **ordering**: misses arrive in bulk and often *before* the
+hit, so the cell is already buried by the time it is first marked, and no
+protect-what-is-currently-occupied rule can see it. With hit `+15` and miss
+`-8` against a `±70` clamp, a handful of grazing rays is enough.
+
+The fix is not that sticky flag. A cell that can never be cleared is a map that
+cannot notice an obstacle being removed, which is exactly what `vanishing`
+exists to catch. What is wanted is a **truncation band around observed
+surface** — free evidence suppressed within a few centimetres of where rays
+have been terminating, with the band moving as the evidence moves. That is what
+a TSDF gives for free: a ray passing near a surface writes a positive signed
+distance rather than "empty", so the zero crossing survives a grazing pass and
+still moves when the surface genuinely goes away. A 5 cm TSDF also resolves a
+surface to roughly voxel/10, at 1/125 the cell count of a 1 cm binary grid.
+
+Not part of this change.
 
 Two other limits are worth stating because a fixture cannot supply them:
 
