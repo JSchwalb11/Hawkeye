@@ -78,8 +78,11 @@ bool timebase_observe_system_time(timebase_session_t *s, timebase_t *tb,
 bool timebase_observe_gps_raw(timebase_session_t *s, timebase_t *tb,
                               uint64_t source_time_usec, uint64_t gps_time_usec);
 
-// TIMESYNC round-trip. `ts1` is the remote stamp, `tc1` the local echo, and
-// local_ns the viewer clock at receipt.
+// TIMESYNC round-trip, taking the fields as they appear in a *reply*: `ts1` is
+// the echo of the stamp we sent, `tc1` is the vehicle's own clock, and
+// local_ns is the viewer clock at receipt. Reading those two the other way
+// round subtracts a boot-relative clock from a wall clock, which is a
+// difference of decades, not milliseconds.
 bool timebase_observe_timesync(timebase_session_t *s, timebase_t *tb,
                                int64_t ts1_ns, int64_t tc1_ns, int64_t local_ns);
 

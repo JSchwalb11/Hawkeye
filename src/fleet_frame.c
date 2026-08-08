@@ -61,6 +61,13 @@ bool fleet_frame_note_origin(fleet_frame_t *ff, uint8_t vehicle_id, uint8_t src,
     } else if (!had) {
         ff->session = *slot;
         ff->origin_vehicle = (int)vehicle_id;
+    } else if (ff->origin_vehicle == (int)vehicle_id) {
+        // The vehicle that defined the session datum has just upgraded its own
+        // origin, so the datum was standing on the worse of the two. Nothing is
+        // frozen yet -- no ray has been placed against it -- so follow the
+        // upgrade rather than anchoring the whole session on a first fix taken
+        // wherever the vehicle happened to be when we attached.
+        ff->session = *slot;
     }
 
     if (!had) return ff->session.valid;

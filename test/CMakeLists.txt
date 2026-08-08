@@ -90,3 +90,17 @@ endif()
 add_executable(test_no_fixture_symbols test_no_fixture_symbols.c)
 target_compile_definitions(test_no_fixture_symbols PRIVATE SRC_DIR="${CMAKE_SOURCE_DIR}/src")
 add_test(NAME no_fixture_symbols COMMAND test_no_fixture_symbols)
+
+# Behaviours no scored fixture can reach: which of two origin messages wins,
+# what a negative increment means, whether an unknown mount produces a ray.
+add_executable(test_map_units test_map_units.c)
+target_link_libraries(test_map_units PRIVATE hawkeye-fixture-support hawkeye-core)
+target_include_directories(test_map_units PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${MAVLINK_DIR} ${MAVLINK_DIR}/common)
+target_compile_definitions(test_map_units PRIVATE MAVLINK_COMM_NUM_BUFFERS=256)
+if(WIN32)
+    target_link_libraries(test_map_units PRIVATE ws2_32)
+endif()
+add_test(NAME map_units COMMAND test_map_units)
+set_tests_properties(map_units PROPERTIES
+    WORKING_DIRECTORY ${FIXTURE_WORKDIR} TIMEOUT 300)
