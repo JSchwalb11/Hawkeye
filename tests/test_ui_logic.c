@@ -27,6 +27,31 @@ static void test_select_updates_selected(void)
     printf("  PASS select_updates_selected\n");
 }
 
+static void test_out_of_range_idx_ignored(void)
+{
+    int pinned[HUD_MAX_PINNED];
+    int pinned_count;
+    int selected = 1;
+    init_pins(pinned, &pinned_count);
+    apply_vehicle_selection(pinned, &pinned_count, 2, true, &selected, 3);
+    assert(pinned_count == 1);
+
+    /* Digit chords can name a vehicle the fleet does not have. Every
+     * per-vehicle array is sized to exactly vehicle_count, so selecting or
+     * pinning past the end has to be a no-op, not an out-of-bounds index. */
+    apply_vehicle_selection(pinned, &pinned_count, 6, false, &selected, 3);
+    assert(selected == 1);
+    assert(pinned_count == 1);
+
+    apply_vehicle_selection(pinned, &pinned_count, 6, true, &selected, 3);
+    assert(pinned_count == 1);
+
+    apply_vehicle_selection(pinned, &pinned_count, -1, false, &selected, 3);
+    assert(selected == 1);
+
+    printf("  PASS out_of_range_idx_ignored\n");
+}
+
 static void test_select_clears_pins(void)
 {
     int pinned[HUD_MAX_PINNED];
@@ -220,6 +245,7 @@ int main(void)
 {
     printf("apply_vehicle_selection:\n");
     test_select_updates_selected();
+    test_out_of_range_idx_ignored();
     test_select_clears_pins();
     test_pin_adds_to_array();
     test_unpin_already_pinned();

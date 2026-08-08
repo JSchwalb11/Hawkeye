@@ -19,6 +19,12 @@ ArduPilot that do not emit that HIL message, Hawkeye requests `ATTITUDE` and
 `GLOBAL_POSITION_INT` at 20 Hz after the heartbeat and combines them into the
 same internal vehicle state. No telemetry bridge is required.
 
+`HIL_STATE_QUATERNION` takes priority. Once it has been seen on a connection,
+`ATTITUDE` and `GLOBAL_POSITION_INT` are ignored for state — otherwise a PX4
+vehicle, which streams all three, would have its HIL attitude replaced by the
+lower-fidelity Euler estimate and its timestamps mixed between the absolute HIL
+clock and the boot-relative one. The native path resumes on reconnect.
+
 ## ULog topics (replay mode)
 
 | Topic                     | Required | Purpose                                       |

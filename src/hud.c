@@ -22,6 +22,7 @@
 
 #define NUMPAD_BTN_SIZE 22
 #define NUMPAD_GAP 2
+#define NUMPAD_COLS 4
 
 
 void hud_init(hud_t *h) {
@@ -133,8 +134,8 @@ static void draw_numpad(const hud_t *h, const vehicle_t *vehicles,
                         int selected, float numpad_x, float numpad_y,
                         Font font_label, float btn_size, float gap, float scale,
                         int *out_cols, int *out_rows) {
-    int cols = 4;
-    int rows = 4;
+    int cols = NUMPAD_COLS;
+    int rows = HUD_FLEET_PAGE_SIZE / NUMPAD_COLS;
     int total_slots = cols * rows;
     if (out_cols) *out_cols = cols;
     if (out_rows) *out_rows = rows;
@@ -145,7 +146,7 @@ static void draw_numpad(const hud_t *h, const vehicle_t *vehicles,
         int col = i % cols;
         float bx = numpad_x + col * (btn_size + gap);
         float by = numpad_y + row * (btn_size + gap);
-        int veh_idx = h->selector_page * 16 + i;
+        int veh_idx = h->selector_page * HUD_FLEET_PAGE_SIZE + i;
 
         bool is_connected = (veh_idx < vehicle_count) && sources[veh_idx].connected;
         bool is_primary = (veh_idx == selected);
@@ -190,8 +191,8 @@ static void draw_numpad(const hud_t *h, const vehicle_t *vehicles,
     }
 
     char page_label[48];
-    int first = h->selector_page * 16 + 1;
-    int last = first + 15;
+    int first = h->selector_page * HUD_FLEET_PAGE_SIZE + 1;
+    int last = first + HUD_FLEET_PAGE_SIZE - 1;
     if (last > vehicle_count) last = vehicle_count;
     snprintf(page_label, sizeof(page_label), "[  %d-%d / %d  ]", first, last, vehicle_count);
     Vector2 pw = MeasureTextEx(font_label, page_label, fs * 0.75f, 0.5f);
@@ -361,7 +362,7 @@ void hud_draw(const hud_t *h, const vehicle_t *vehicles,
     DrawLineEx((Vector2){0, (float)bar_y}, (Vector2){(float)screen_w, (float)bar_y}, 1.0f, border);
 
     // At fleet scale, keep the limiting member visible instead of averaging it away.
-    if (vehicle_count > 16) {
+    if (vehicle_count > HUD_FLEET_PAGE_SIZE) {
         int connected = 0;
         float min_alt = INFINITY, max_alt = -INFINITY;
         uint64_t slowest_clock = UINT64_MAX;
@@ -523,7 +524,7 @@ void hud_draw(const hud_t *h, const vehicle_t *vehicles,
     float np_btn = NUMPAD_BTN_SIZE * s;
     float np_gap = NUMPAD_GAP * s;
     float status_x = (float)(screen_w - 16 * s - 110 * s);
-    int np_cols = 4;
+    int np_cols = NUMPAD_COLS;
     float numpad_total_w = np_cols * (np_btn + np_gap) - np_gap;
     float numpad_x = status_x - 20 * s - numpad_total_w;
     float timer_x = numpad_x - 24 * s - 60 * s;
@@ -576,7 +577,7 @@ void hud_draw(const hud_t *h, const vehicle_t *vehicles,
 
     // Numpad (only when vehicle_count > 1)
     if (vehicle_count > 1) {
-        int np_r = 4;
+        int np_r = HUD_FLEET_PAGE_SIZE / NUMPAD_COLS;
         float np_grid_h = np_r * (np_btn + np_gap) - np_gap;
         float np_y = bar_y + (primary_h / 2.0f) - np_grid_h / 2.0f;
         int np_c_out, np_r_out;
