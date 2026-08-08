@@ -40,9 +40,16 @@ The same information is listed below for offline reference.
 | `Shift+M`                 | Cycle across all vehicle model groups               |
 | `TAB`                     | Cycle to next vehicle (clears pins)                 |
 | `1`–`9`                   | Select vehicle directly                             |
-| `1`–`9` (two-digit chord) | Select drones 10–16 (press within 300 ms)           |
+| `1`–`9` (multi-digit chord) | Select drones 10 and up (each digit within 300 ms) |
 | `Shift+1`–`Shift+9`       | Toggle pin/unpin vehicle to HUD sidebar             |
+| `PageUp` / `PageDown`     | Previous / next selector page (fleets over 16)      |
+| Left click on a vehicle   | Select it (a click, not a camera-orbit drag)        |
 | `Ctrl+L`                  | Toggle screen edge indicators for off-screen drones |
+
+The numpad selector shows 16 vehicles at a time.
+With a larger fleet, `PageUp` / `PageDown` scroll through the pages, and the
+page currently in view is shown above the grid as `[ 17-32 / 40 ]`.
+Selecting a vehicle by number or by click jumps the selector to its page.
 
 ## Replay
 

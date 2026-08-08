@@ -150,6 +150,12 @@ Correlation analysis provides real-time Pearson correlation and RMSE statistics 
 
 ![Correlation HUD](./assets/sim_hawkeye/correlation-hud.png)
 
+Correlation is accumulated for the 16 drones on the selected drone's selector
+page, not the entire fleet — the statistics are pairwise against the selected
+drone, so scoring 254 partners every frame would cost far more than it tells
+you. Changing the selection resets every drone's PRSN / RMSE and starts the
+accumulators over.
+
 _<!-- 07-img-07: HUD sidebar showing PRSN/RMSE/CONF badges with example values. -->_
 
 ### The metrics

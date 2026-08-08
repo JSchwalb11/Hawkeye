@@ -220,6 +220,7 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
                         recv->state.true_airspeed = hil.true_airspeed;
                         recv->state.time_usec = hil.time_usec;
                         recv->state.valid = true;
+                        recv->hil_valid = true;
 
                         if (recv->debug) {
                             printf("  HIL_STATE_Q: lat=%d lon=%d alt=%d q=[%.3f,%.3f,%.3f,%.3f]\n",
@@ -231,6 +232,10 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
                     }
 
                     case MAVLINK_MSG_ID_ATTITUDE: {
+                        // Fallback only. PX4 streams ATTITUDE alongside
+                        // HIL_STATE_QUATERNION; taking it would downgrade the
+                        // attitude and mix boot-relative into absolute time.
+                        if (recv->hil_valid) break;
                         mavlink_attitude_t attitude;
                         mavlink_msg_attitude_decode(&msg, &attitude);
                         euler_to_quaternion(attitude.roll, attitude.pitch,
@@ -249,6 +254,7 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
                     }
 
                     case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
+                        if (recv->hil_valid) break;  // see ATTITUDE above
                         mavlink_global_position_int_t position;
                         mavlink_msg_global_position_int_decode(&msg, &position);
                         recv->state.lat = position.lat;
@@ -281,6 +287,7 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
             recv->connected = false;
             recv->state.valid = false;
             recv->home.valid = false;
+            recv->hil_valid = false;
             recv->attitude_valid = false;
             recv->global_position_valid = false;
             recv->sender_known = false;

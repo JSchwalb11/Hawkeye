@@ -14,7 +14,6 @@
 
 #include "raylib.h"
 #include "raymath.h"
-#include "rlgl.h"
 #include "data_source.h"
 #include "vehicle.h"
 #include "scene.h"
@@ -31,12 +30,14 @@
 #include "tactical_hud.h"
 
 #define VEHICLE_SANITY_LIMIT 255
-#define FLEET_PAGE_SIZE 16
+// Selector paging is shared with the numpad renderer; see hud.h.
+#define FLEET_PAGE_SIZE HUD_FLEET_PAGE_SIZE
 #define EARTH_RADIUS 6371000.0
 
 #include "correlation.h"
 
 #define CHORD_TIMEOUT_S 0.3
+#define CLICK_DRAG_SLOP_PX 4.0f
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
@@ -281,11 +282,18 @@ int main(int argc, char *argv[]) {
     bool is_replay = (num_replay_files > 0);
     if (is_replay) vehicle_count = num_replay_files;
     data_source_t *sources = calloc((size_t)vehicle_count, sizeof(*sources));
+    if (!sources) {
+        fprintf(stderr, "Failed to allocate data sources for %d vehicles\n", vehicle_count);
+        free(replay_paths);
+        CloseWindow();
+        return 1;
+    }
 
     if (is_replay) {
         for (int i = 0; i < num_replay_files; i++) {
             if (data_source_ulog_create(&sources[i], replay_paths[i]) != 0) {
                 fprintf(stderr, "Failed to open ULog: %s\n", replay_paths[i]);
+                free(replay_paths); free(sources);
                 CloseWindow();
                 return 1;
             }
@@ -294,6 +302,7 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < vehicle_count; i++) {
             if (data_source_mavlink_create(&sources[i], base_port + i, (uint8_t)i, debug) != 0) {
                 fprintf(stderr, "Failed to init MAVLink receiver on port %u\n", base_port + i);
+                free(replay_paths); free(sources);
                 CloseWindow();
                 return 1;
             }
@@ -307,7 +316,7 @@ int main(int argc, char *argv[]) {
 
     vehicle_t *vehicles = calloc((size_t)vehicle_count, sizeof(*vehicles));
     corr_state_t *corr = calloc((size_t)vehicle_count, sizeof(*corr));
-    if (!sources || !vehicles || !corr) {
+    if (!vehicles || !corr) {
         fprintf(stderr, "Failed to allocate state for %d vehicles\n", vehicle_count);
         free(replay_paths); free(sources); free(vehicles); free(corr);
         CloseWindow();
@@ -492,6 +501,10 @@ int main(int argc, char *argv[]) {
     float saved_chase_distance = 0.0f;
     float tactical_chase_target = 1.6f;
 
+    // Click-vs-drag state for ray-picking a vehicle in the 3D view
+    Vector2 click_origin = {0};
+    bool click_in_view = false;
+
     // Key chord state for two-digit drone selection (10-16)
     int chord_value = -1;       // accumulated 1-based vehicle number
     double chord_time = 0.0;    // when first digit was pressed
@@ -519,6 +532,11 @@ int main(int argc, char *argv[]) {
         !all_user_md || !all_sys_md) {
         fprintf(stderr, "Failed to allocate per-vehicle UI state for %d vehicles\n",
                 vehicle_count);
+        free(replay_paths);
+        free(sources); free(vehicles); free(corr); free(vehicle_tier);
+        free(was_connected); free(last_pos); free(insufficient_data);
+        free(prev_playback_pos); free(markers); free(sys_markers); free(precomp);
+        free(all_user_md); free(all_sys_md);
         CloseWindow();
         return 1;
     }
@@ -648,10 +666,10 @@ int main(int argc, char *argv[]) {
             // Reset accumulators when selection changes
             if (selected != prev_selected) {
                 memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
-                int corr_page_first = (selected / FLEET_PAGE_SIZE) * FLEET_PAGE_SIZE;
-                int corr_page_last = corr_page_first + FLEET_PAGE_SIZE;
-                if (corr_page_last > num_replay_files) corr_page_last = num_replay_files;
-                for (int i = corr_page_first; i < corr_page_last; i++) {
+                // Reset the whole fleet, not just the page we are about to
+                // accumulate: off-page drones would otherwise keep displaying
+                // correlations computed against the previous reference.
+                for (int i = 0; i < num_replay_files; i++) {
                     sources[i].playback.correlation = NAN;
                     sources[i].playback.rmse = NAN;
                 }
@@ -862,7 +880,7 @@ int main(int argc, char *argv[]) {
                 }
             }
             // Reset stats on mode switch
-            memset(corr, 0, sizeof(corr));
+            memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
             for (int i = 0; i < num_replay_files; i++) {
                 sources[i].playback.correlation = NAN;
                 sources[i].playback.rmse = NAN;
@@ -956,8 +974,15 @@ int main(int argc, char *argv[]) {
 
         // Vehicle selection input
         if (vehicle_count > 1) {
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
-                GetMouseY() < GetScreenHeight() - hud_bar_height(&hud, GetScreenHeight())) {
+            // Pick on release, not press: left-drag orbits the camera (scene.c),
+            // so a press over a drone would otherwise reselect mid-orbit.
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                click_origin = GetMousePosition();
+                click_in_view = GetMouseY() <
+                    GetScreenHeight() - hud_bar_height(&hud, GetScreenHeight());
+            }
+            if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && click_in_view &&
+                Vector2Distance(click_origin, GetMousePosition()) < CLICK_DRAG_SLOP_PX) {
                 Ray ray = GetMouseRay(GetMousePosition(), scene.camera);
                 float nearest = INFINITY;
                 int hit = -1;
@@ -991,14 +1016,13 @@ int main(int argc, char *argv[]) {
                 chord_value = -1;
                 hud.selector_page = selected / FLEET_PAGE_SIZE;
             }
-            if (IsKeyPressed(KEY_LEFT_BRACKET) && !is_replay) {
+            // PageUp/PageDown scroll the selector, in replay as well as live —
+            // [ and ] stay on marker cycling, as docs/keybinds.md documents.
+            if ((IsKeyPressed(KEY_PAGE_UP) || IsKeyPressed(KEY_PAGE_DOWN)) &&
+                vehicle_count > FLEET_PAGE_SIZE) {
                 int pages = (vehicle_count + FLEET_PAGE_SIZE - 1) / FLEET_PAGE_SIZE;
-                hud.selector_page = (hud.selector_page + pages - 1) % pages;
-                chord_value = -1;
-            }
-            if (IsKeyPressed(KEY_RIGHT_BRACKET) && !is_replay) {
-                int pages = (vehicle_count + FLEET_PAGE_SIZE - 1) / FLEET_PAGE_SIZE;
-                hud.selector_page = (hud.selector_page + 1) % pages;
+                int dir = IsKeyPressed(KEY_PAGE_UP) ? -1 : 1;
+                hud.selector_page = (hud.selector_page + dir + pages) % pages;
                 chord_value = -1;
             }
             // Number chords accept every digit required by the runtime fleet size.
@@ -1030,9 +1054,12 @@ int main(int argc, char *argv[]) {
                         chord_value = chord_value * 10 + digit;
                     }
                     chord_time = GetTime();
+                    // apply_vehicle_selection() does not range-check, and every
+                    // per-vehicle array is sized to exactly vehicle_count.
                     if (vehicle_count <= 9 && chord_value > 0) {
-                        apply_vehicle_selection_hud(&hud, chord_value - 1, chord_shift,
-                                                    &selected, vehicle_count);
+                        if (chord_value <= vehicle_count)
+                            apply_vehicle_selection_hud(&hud, chord_value - 1, chord_shift,
+                                                        &selected, vehicle_count);
                         hud.selector_page = selected / FLEET_PAGE_SIZE;
                         chord_value = -1;
                     }
@@ -1071,7 +1098,7 @@ int main(int argc, char *argv[]) {
                         sources[i].playback.paused = false;
                         vehicle_reset_trail(&vehicles[i]);
                     }
-                    memset(corr, 0, sizeof(corr));
+                    memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
                 } else {
                     bool p = !sources[selected].playback.paused;
                     for (int i = 0; i < nrf; i++)
@@ -1128,7 +1155,7 @@ int main(int argc, char *argv[]) {
                     sources[i].playback.paused = false;
                     vehicle_reset_trail(&vehicles[i]);
                 }
-                memset(corr, 0, sizeof(corr));
+                memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
                 for (int i = 0; i < vehicle_count; i++) {
                     markers[i].count = 0;
                     markers[i].current = -1;
@@ -1152,7 +1179,7 @@ int main(int argc, char *argv[]) {
                     sources[i].playback.paused = false;
                     vehicle_reset_trail(&vehicles[i]);
                 }
-                memset(corr, 0, sizeof(corr));
+                memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
                 for (int i = 0; i < nrf; i++) {
                     sources[i].playback.correlation = NAN;
                     sources[i].playback.rmse = NAN;
@@ -1175,7 +1202,7 @@ int main(int argc, char *argv[]) {
                     data_source_seek(&sources[i], seek_target);
                     vehicle_reset_trail(&vehicles[i]);
                 }
-                memset(corr, 0, sizeof(corr));
+                memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
             }
             if (IsKeyPressed(KEY_LEFT)) {
                 float step;
@@ -1188,7 +1215,7 @@ int main(int argc, char *argv[]) {
                     data_source_seek(&sources[i], target);
                     vehicle_reset_trail(&vehicles[i]);
                 }
-                memset(corr, 0, sizeof(corr));
+                memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
             }
 
             // Frame markers: B = drop marker, B->L = drop + label, Shift+B = delete current
@@ -1289,17 +1316,11 @@ int main(int argc, char *argv[]) {
                 scene_draw(&scene);
                 if (vehicle_count > 60) {
                     draw_density_heatmap(vehicles, vehicle_count, scene.theme);
-                    rlPointSize(2.0f);
-                    for (int c = 0; c < THEME_DRONE_PALETTE_SIZE; c++) {
-                        Color color = scene.theme->drone_palette[c];
-                        rlBegin(RL_POINTS);
-                        rlColor4ub(color.r, color.g, color.b, color.a);
-                        for (int i = c; i < vehicle_count; i += THEME_DRONE_PALETTE_SIZE) {
-                            if (i == selected || !vehicles[i].active) continue;
-                            rlVertex3f(vehicles[i].position.x, vehicles[i].position.y,
-                                       vehicles[i].position.z);
-                        }
-                        rlEnd();
+                    // rlgl has no RL_POINTS primitive; DrawPoint3D is raylib's
+                    // point, batched into the same RL_LINES draw call.
+                    for (int i = 0; i < vehicle_count; i++) {
+                        if (i == selected || !vehicles[i].active) continue;
+                        DrawPoint3D(vehicles[i].position, vehicles[i].color);
                     }
                 }
                 for (int i = 0; i < vehicle_count; i++) {
@@ -1396,9 +1417,16 @@ int main(int argc, char *argv[]) {
 
             // Colour repeats after the finite palette; the runtime index never does.
             if (vehicle_count > 16) {
+                Vector3 label_cam_fwd = Vector3Normalize(Vector3Subtract(
+                    scene.camera.target, scene.camera.position));
                 for (int i = 0; i < vehicle_count; i++) {
                     if (vehicle_count > 60 && i != selected) continue;
                     if (!vehicles[i].active) continue;
+                    // GetWorldToScreen mirrors points behind the camera onto
+                    // the viewport; skip them rather than draw phantom labels.
+                    if (Vector3DotProduct(Vector3Subtract(vehicles[i].position,
+                                                          scene.camera.position),
+                                          label_cam_fwd) <= 0.0f) continue;
                     Vector2 p = GetWorldToScreen(vehicles[i].position, scene.camera);
                     char label[16];
                     snprintf(label, sizeof(label), "%d", i + 1);
