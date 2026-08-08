@@ -185,4 +185,12 @@ void vehicle_draw_correlation_line(
 // Unload model resources.
 void vehicle_cleanup(vehicle_t *v);
 
+// Draw a sphere from one shared, pre-uploaded unit mesh.
+// Drop-in for raylib's DrawSphere(), which re-tessellates 1,536 vertices on the
+// CPU through rlVertex3f on every call. Same radius, colour and position.
+void vehicle_draw_sphere(Vector3 center, float radius, Color color);
+
+// Release the shared geometry above. Call once, before CloseWindow().
+void vehicle_unload_shared(void);
+
 #endif

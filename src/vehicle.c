@@ -1165,7 +1165,7 @@ void vehicle_draw_markers(Vector3 *positions, char labels[][48], int count,
                 DrawLine3D(bl, tl, sq_col);
             }
         } else {
-            DrawSphere(p, is_current ? size * 1.4f : size, col);
+            vehicle_draw_sphere(p, is_current ? size * 1.4f : size, col);
             DrawLine3D(p, (Vector3){p.x, 0.0f, p.z}, (Color){col.r, col.g, col.b, 80});
 
             if (is_current) {
@@ -1424,6 +1424,31 @@ void vehicle_draw_correlation_line(
         }
     }
     rlEnd();
+}
+
+// Shared marker sphere. raylib's DrawSphere() runs DrawSphereEx(..., 16, 16),
+// which rebuilds 1,536 vertices per call on the CPU -- with a sinf/cosf pair
+// per vertex -- and pushes every one through rlVertex3f. That showed up in the
+// profile as 9.1% cumulative, and the cost scales with fleet size, which this
+// fork now allows up to 255. One unit sphere, uploaded once, is instead drawn
+// per vehicle through a scale matrix.
+static Model shared_sphere;
+static bool shared_sphere_ready = false;
+
+void vehicle_draw_sphere(Vector3 center, float radius, Color color) {
+    if (!shared_sphere_ready) {
+        // Same 16x16 tessellation DrawSphere() uses, so the silhouette matches.
+        shared_sphere = LoadModelFromMesh(GenMeshSphere(1.0f, 16, 16));
+        shared_sphere_ready = true;
+    }
+    DrawModelEx(shared_sphere, center, (Vector3){0.0f, 1.0f, 0.0f}, 0.0f,
+                (Vector3){radius, radius, radius}, color);
+}
+
+void vehicle_unload_shared(void) {
+    if (!shared_sphere_ready) return;
+    UnloadModel(shared_sphere);
+    shared_sphere_ready = false;
 }
 
 void vehicle_cleanup(vehicle_t *v) {

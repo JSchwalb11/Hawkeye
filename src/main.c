@@ -1662,7 +1662,7 @@ int main(int argc, char *argv[]) {
                                          show_ground_track, scene.camera.position,
                                          classic_colors);
                         } else if (vehicle_count <= 60) {
-                            DrawSphere(vehicles[i].position, 0.18f, vehicles[i].color);
+                            vehicle_draw_sphere(vehicles[i].position, 0.18f, vehicles[i].color);
                         }
                     }
                 }
@@ -1944,6 +1944,7 @@ int main(int argc, char *argv[]) {
         vehicle_cleanup(&vehicles[i]);
         if (sources[i].ops) data_source_close(&sources[i]);
     }
+    vehicle_unload_shared();
     scene_cleanup(&scene);
     for (int i = 0; i < vehicle_count; i++)
         precomp_trail_cleanup(&precomp[i]);
