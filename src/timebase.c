@@ -113,21 +113,28 @@ bool timebase_observe_gps_raw(timebase_session_t *s, timebase_t *tb,
 bool timebase_observe_timesync(timebase_session_t *s, timebase_t *tb,
                                int64_t ts1_ns, int64_t tc1_ns, int64_t local_ns) {
     if (!s || !tb) return false;
-    if (ts1_ns == 0) return false;
+    // In a reply, ts1 is the echo of *our* send stamp and tc1 is the vehicle's
+    // clock. Mixing them up subtracts a boot-relative clock from a wall clock
+    // and yields an offset decades wide -- which then outranks and destroys a
+    // perfectly good arrival alignment.
+    if (ts1_ns == 0 || tc1_ns == 0) return false;
 
-    const int64_t rtt = local_ns - tc1_ns;
+    const int64_t rtt = local_ns - ts1_ns;
     if (rtt < 0) return false;
+    // A round trip longer than a minute is not a measurement, it is a clock
+    // that does not belong to us.
+    if (rtt > 60000000000LL) return false;
 
     tb->rtt_ns = rtt;
     if (rtt < tb->rtt_ns_min) tb->rtt_ns_min = rtt;
     tb->timesync_count++;
 
-    // Remote stamp corresponds to roughly the midpoint of the round trip.
-    const int64_t local_at_remote = tc1_ns + rtt / 2;
-    note_source(tb, ts1_ns);
+    // The vehicle stamped tc1 at roughly the midpoint of the round trip.
+    const int64_t local_at_remote = ts1_ns + rtt / 2;
+    note_source(tb, tc1_ns);
     session_adopt_epoch(s, local_at_remote);
 
-    const int64_t offset = (local_at_remote - s->epoch_unix_ns) - ts1_ns;
+    const int64_t offset = (local_at_remote - s->epoch_unix_ns) - tc1_ns;
     return apply_offset(tb, offset, TIME_PROV_TIMESYNC);
 }
 

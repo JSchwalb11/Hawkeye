@@ -40,7 +40,12 @@ typedef struct {
     double  coverage_min;          // fraction of swept volume that is not unknown
     int64_t occupied_cells_min;
     int64_t occupied_cells_max;    // -1 = unbounded
-    double  memory_plateau_ratio;  // late/early byte ratio ceiling, 0 = unchecked
+    double  memory_plateau_ratio;  // late/early live-node ratio ceiling, 0 = unchecked
+    // Absolute bounds. A self-referential ratio cannot notice pruning being
+    // switched off -- the map just grows uniformly and the ratio improves. An
+    // absolute ceiling can, and a deterministic fixture can assert one.
+    int64_t live_nodes_max;        // 0 = unchecked
+    int64_t prune_blocks_min;      // blocks pruning must have reclaimed, 0 = unchecked
     double  min_rays_per_s;        // 0 = unchecked
     int     require_drops;         // 1 = drops must be non-zero and reported
     double  contested_max_dist_m;  // contested cells must sit within this of the offset band

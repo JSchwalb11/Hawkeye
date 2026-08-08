@@ -87,6 +87,8 @@ typedef struct {
 // Compact enough that a byte budget buys a useful amount of history. Float
 // precision is ~1e-7 relative, far below the 0.25 m leaf size at any range the
 // root cube covers.
+#define TL_RAY_SKIPPED 0x01   // shed by the ingest queue; the map never saw it
+
 typedef struct {
     int64_t  t_ns;
     float    origin[3];
@@ -95,6 +97,7 @@ typedef struct {
     uint8_t  hit;
     uint8_t  weight_q;     // weight * 255
     uint8_t  cone_cm;      // cone radius in centimetres, saturating
+    uint8_t  flags;
 } tl_ray_t;
 
 // --- Map keyframes ------------------------------------------------------
@@ -167,9 +170,15 @@ void timeline_add_sample(timeline_t *tl, uint8_t vehicle_id, const tl_sample_t *
 void timeline_add_event(timeline_t *tl, const tl_event_t *e);
 void timeline_note_drop(timeline_t *tl, int64_t t_ns, uint8_t vehicle_id, uint32_t dropped);
 
-// Record a ray in the history. Call for every ray that reaches the map so that
-// scrubbing can rebuild what the map knew at any point.
-void timeline_add_ray(timeline_t *tl, const om_ray_t *ray, int64_t t_ns);
+// Record a ray in the history. Call for every ray handed to the ingest queue;
+// the returned lifetime index is what the queue reports progress in. Scrubbing
+// rebuilds the map from this log, so it has to describe exactly what the map
+// was built from -- no more and no less.
+uint64_t timeline_add_ray(timeline_t *tl, const om_ray_t *ray, int64_t t_ns);
+
+// Mark a recorded ray as never having reached the map. Replay skips it, so a
+// reconstruction cannot end up denser than what the operator actually saw.
+void timeline_mark_ray_skipped(timeline_t *tl, uint64_t seq);
 
 // --- Query --------------------------------------------------------------
 

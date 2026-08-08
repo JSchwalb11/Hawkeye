@@ -164,6 +164,9 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .surface_rms_max_m = 0.80, .false_occupied_max = 0.20, .false_free_max = 0.10,
         .coverage_min = 0.90, .occupied_cells_min = 1000, .occupied_cells_max = -1,
         .memory_plateau_ratio = 1.25,
+        // The ratio alone is not enough: with pruning disabled the map grows
+        // uniformly and the ratio actually improves. These two are what notice.
+        .live_nodes_max = 60000, .prune_blocks_min = 100000,
     }, 0, 0, 16 },
 };
 

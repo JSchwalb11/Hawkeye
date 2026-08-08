@@ -39,8 +39,16 @@ typedef struct {
     uint32_t prune_count;
 } map_ingest_stats_t;
 
+// Each queued ray carries the lifetime index it has in the timeline ray log,
+// so the map's progress can be reported in the log's own terms rather than
+// assumed. Assuming was how keyframes came to claim rays still sitting here.
 typedef struct {
-    om_ray_t *ring;
+    om_ray_t ray;
+    uint64_t seq;
+} mi_entry_t;
+
+typedef struct {
+    mi_entry_t *ring;
     uint32_t  cap;
     uint32_t  head;     // next slot to write
     uint32_t  tail;     // next slot to read
@@ -56,6 +64,15 @@ typedef struct {
     uint64_t  accum_inserted;
     uint64_t  accum_dropped;
 
+    // Lifetime index of the newest ray actually inserted into the map, plus a
+    // small ring of indices shed under overload so the caller can mark them in
+    // the history. Without this, live and replay disagree about what the map
+    // was ever built from.
+    uint64_t  last_inserted_seq;
+    bool      have_inserted;
+    uint64_t  dropped_seq[64];
+    uint32_t  dropped_seq_count;
+
     map_ingest_stats_t stats;
 } map_ingest_t;
 
@@ -63,11 +80,22 @@ int  map_ingest_init(map_ingest_t *mi, const map_ingest_config_t *cfg);
 void map_ingest_free(map_ingest_t *mi);
 void map_ingest_reset(map_ingest_t *mi);
 
-// Enqueue. Returns false when an older ray had to be shed to make room.
-bool map_ingest_push(map_ingest_t *mi, const om_ray_t *ray);
+// Enqueue a ray, tagged with its lifetime index in the timeline ray log.
+// Returns false when an older ray had to be shed to make room.
+bool map_ingest_push(map_ingest_t *mi, const om_ray_t *ray, uint64_t seq);
 
-// Enqueue a batch that shares an origin. Returns the number of rays shed.
-uint32_t map_ingest_push_batch(map_ingest_t *mi, const om_ray_t *rays, int count);
+// Enqueue a batch that shares an origin, with consecutive indices from `seq0`.
+// Returns the number of rays shed.
+uint32_t map_ingest_push_batch(map_ingest_t *mi, const om_ray_t *rays, int count,
+                               uint64_t seq0);
+
+// Drop everything pending without inserting it. Used while the playhead is
+// scrubbed: those rays belong in the history, but not in a view of the past.
+// They are not counted as overload drops.
+uint32_t map_ingest_discard_all(map_ingest_t *mi);
+
+// Take the indices shed since the last call. Returns the count written.
+uint32_t map_ingest_take_dropped(map_ingest_t *mi, uint64_t *out, uint32_t max_out);
 
 // Count an observation that decoded but carried nothing usable.
 void map_ingest_note_rejected(map_ingest_t *mi);

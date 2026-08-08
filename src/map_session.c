@@ -205,10 +205,21 @@ static void enqueue_rays(map_session_t *ms, int slot, int64_t t_ns,
         return;
     }
 
+    // Log first, so each ray has the lifetime index the queue will report its
+    // progress in. The log is the record of what the map is built from, so it
+    // has to be the thing everything else is expressed against.
     const uint64_t before = ms->ingest.stats.dropped;
-    map_ingest_push_batch(&ms->ingest, rays, count);
-    for (int i = 0; i < count; i++) timeline_add_ray(&ms->timeline, &rays[i], t_ns);
+    const uint64_t seq0 = timeline_add_ray(&ms->timeline, &rays[0], t_ns);
+    for (int i = 1; i < count; i++) timeline_add_ray(&ms->timeline, &rays[i], t_ns);
+    map_ingest_push_batch(&ms->ingest, rays, count, seq0);
     v->rays_contributed += (uint64_t)count;
+
+    // Anything the queue shed never reached the map; mark it so a later
+    // reconstruction does not invent evidence the operator never saw.
+    uint64_t lost[64];
+    uint32_t nlost = map_ingest_take_dropped(&ms->ingest, lost, 64);
+    for (uint32_t i = 0; i < nlost; i++)
+        timeline_mark_ray_skipped(&ms->timeline, lost[i]);
 
     const uint64_t shed = ms->ingest.stats.dropped - before;
     if (shed) timeline_note_drop(&ms->timeline, t_ns, (uint8_t)slot, (uint32_t)shed);
@@ -266,23 +277,39 @@ void map_session_tick(map_session_t *ms, float dt_s) {
     timeline_advance(&ms->timeline, dt_s);
 
     if (ms->timeline.playhead.pinned_to_head) {
+        // Coming back to live after a scrub, the map is still showing the past.
+        // Rebuild it to the head before resuming incremental insertion --
+        // stamping the cursor instead would leave nothing to replay and freeze
+        // the map there for the rest of the session.
+        if (!ms->timeline.map_valid) {
+            ms->timeline.playhead.t_ns = ms->timeline.head_ns;
+            timeline_sync_map(&ms->timeline, &ms->map);
+        }
+
         // Live: rays flow straight into the map and the map is the head state.
         map_ingest_drain(&ms->ingest, &ms->map, dt_s);
-        ms->timeline.map_cursor = ms->timeline.ray_total;
+        // Report progress in the log's own terms. The drain is budgeted, so
+        // assuming it consumed everything is how keyframes came to claim rays
+        // that were still queued.
+        if (ms->ingest.have_inserted)
+            ms->timeline.map_cursor = ms->ingest.last_inserted_seq + 1;
         ms->timeline.map_state_ns = ms->timeline.head_ns;
         ms->timeline.map_valid = true;
         timeline_maybe_keyframe(&ms->timeline, &ms->map, ms->timeline.head_ns);
     } else {
-        // Scrubbed: the queue still drains so the ray log stays complete, but
-        // the map is whatever the playhead says it should be.
-        map_ingest_drain(&ms->ingest, &ms->map, dt_s);
+        // Scrubbed: the map shows the past, so live rays must not be inserted
+        // into it. They are already in the ray log, so the reconstruction (and
+        // the rebuild on the way back to live) covers them.
+        map_ingest_discard_all(&ms->ingest);
         timeline_sync_map(&ms->timeline, &ms->map);
     }
 }
 
 uint32_t map_session_resync(map_session_t *ms) {
     if (!ms) return 0;
-    map_ingest_drain_all(&ms->ingest, &ms->map);
+    // Pending rays belong to the head, not to wherever the playhead is, so they
+    // are dropped from the queue rather than inserted. The log still has them.
+    map_ingest_discard_all(&ms->ingest);
     ms->timeline.map_valid = false;
     return timeline_sync_map(&ms->timeline, &ms->map);
 }

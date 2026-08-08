@@ -17,7 +17,7 @@ int map_ingest_init(map_ingest_t *mi, const map_ingest_config_t *cfg) {
     while (p < cap && p < (1u << 30)) p <<= 1;
     cap = p;
 
-    mi->ring = (om_ray_t *)calloc(cap, sizeof(om_ray_t));
+    mi->ring = (mi_entry_t *)calloc(cap, sizeof(mi_entry_t));
     if (!mi->ring) return -1;
     mi->cap = cap;
     mi->budget = (cfg && cfg->budget_per_drain) ? cfg->budget_per_drain : MI_DEFAULT_BUDGET;
@@ -41,17 +41,23 @@ void map_ingest_reset(map_ingest_t *mi) {
     mi->since_prune_s = 0.0f;
 }
 
-bool map_ingest_push(map_ingest_t *mi, const om_ray_t *ray) {
+bool map_ingest_push(map_ingest_t *mi, const om_ray_t *ray, uint64_t seq) {
     if (!mi || !mi->ring || !ray) return false;
     bool ok = true;
     if (mi->count == mi->cap) {
         // Shed the oldest: a stale ray is worth less than the one arriving.
+        // Remember which one, so the history can record that the map never
+        // saw it rather than quietly disagreeing with itself on replay.
+        const uint64_t lost = mi->ring[mi->tail].seq;
+        if (mi->dropped_seq_count < (uint32_t)(sizeof(mi->dropped_seq) / sizeof(mi->dropped_seq[0])))
+            mi->dropped_seq[mi->dropped_seq_count++] = lost;
         mi->tail = (mi->tail + 1) & (mi->cap - 1);
         mi->count--;
         mi->stats.dropped++;
         ok = false;
     }
-    mi->ring[mi->head] = *ray;
+    mi->ring[mi->head].ray = *ray;
+    mi->ring[mi->head].seq = seq;
     mi->head = (mi->head + 1) & (mi->cap - 1);
     mi->count++;
     mi->stats.enqueued++;
@@ -59,11 +65,30 @@ bool map_ingest_push(map_ingest_t *mi, const om_ray_t *ray) {
     return ok;
 }
 
-uint32_t map_ingest_push_batch(map_ingest_t *mi, const om_ray_t *rays, int count) {
+uint32_t map_ingest_push_batch(map_ingest_t *mi, const om_ray_t *rays, int count,
+                               uint64_t seq0) {
     uint32_t shed = 0;
     for (int i = 0; i < count; i++)
-        if (!map_ingest_push(mi, &rays[i])) shed++;
+        if (!map_ingest_push(mi, &rays[i], seq0 + (uint64_t)i)) shed++;
     return shed;
+}
+
+uint32_t map_ingest_discard_all(map_ingest_t *mi) {
+    if (!mi || !mi->ring) return 0;
+    const uint32_t n = mi->count;
+    mi->tail = mi->head;
+    mi->count = 0;
+    mi->stats.queue_depth = 0;
+    return n;
+}
+
+uint32_t map_ingest_take_dropped(map_ingest_t *mi, uint64_t *out, uint32_t max_out) {
+    if (!mi || !out) return 0;
+    uint32_t n = mi->dropped_seq_count;
+    if (n > max_out) n = max_out;
+    for (uint32_t i = 0; i < n; i++) out[i] = mi->dropped_seq[i];
+    mi->dropped_seq_count = 0;
+    return n;
 }
 
 void map_ingest_note_rejected(map_ingest_t *mi) {
@@ -87,7 +112,9 @@ static void maintain(map_ingest_t *mi, octomap_t *map, float dt) {
 static uint32_t drain_n(map_ingest_t *mi, octomap_t *map, uint32_t budget) {
     uint32_t n = 0;
     while (n < budget && mi->count > 0) {
-        octomap_insert_ray(map, &mi->ring[mi->tail]);
+        octomap_insert_ray(map, &mi->ring[mi->tail].ray);
+        mi->last_inserted_seq = mi->ring[mi->tail].seq;
+        mi->have_inserted = true;
         mi->tail = (mi->tail + 1) & (mi->cap - 1);
         mi->count--;
         n++;

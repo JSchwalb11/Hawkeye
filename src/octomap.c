@@ -389,8 +389,14 @@ static void apply_point(octomap_t *m, const double p[3], int target_depth,
     double half = m->root_half;
 
     for (;;) {
-        if (depth >= target_depth) break;
-        if (!m->nodes[idx].children) {
+        if (depth >= target_depth) {
+            // Reaching the target depth is not the same as reaching a leaf. The
+            // carve pass runs before the hit and may already have subdivided
+            // this node, and every reader descends past interior nodes to a
+            // true leaf -- so stopping here would write the evidence somewhere
+            // nothing ever looks.
+            if (!m->nodes[idx].children) break;
+        } else if (!m->nodes[idx].children) {
             const bool must_split = (delta > 0) || (m->nodes[idx].log_odds >= m->occ_threshold);
             if (!must_split) break;
             if (!node_subdivide(m, idx)) break;
@@ -437,11 +443,13 @@ static bool slab_clip(const carve_ray_t *r, const double lo[3], const double hi[
     return true;
 }
 
-// Depth this stretch of the ray deserves: coarse in the far field, full
-// resolution for the last refine_dist_m so carving cannot erode the surface it
-// is about to mark occupied.
-static int carve_depth_for(const octomap_t *m, double dist_to_end) {
-    return (dist_to_end > m->refine_dist_m) ? m->coarse_depth : m->max_depth;
+// Depth this stretch of the ray deserves: coarse in the far field, and near the
+// endpoint as fine as the *sensor* can justify. A 25-degree sonar cannot place a
+// surface to a quarter of a metre, so refining its neighbourhood that finely
+// would invent detail -- the cone's own footprint is the resolution limit, and
+// that is what makes a sonar's cells visibly coarser than a laser's.
+static int carve_depth_for(const octomap_t *m, double dist_to_end, int fine_depth) {
+    return (dist_to_end > m->refine_dist_m) ? m->coarse_depth : fine_depth;
 }
 
 // `marked` says an ancestor at or above the chunk depth has already flagged the
@@ -450,13 +458,14 @@ static int carve_depth_for(const octomap_t *m, double dist_to_end) {
 static void carve_rec(octomap_t *m, uint32_t idx, int depth,
                       double cx, double cy, double cz, double half,
                       const carve_ray_t *r, double t_enter, double t_exit,
-                      int delta, uint8_t vehicle_id, uint32_t time_ms, bool marked) {
-    int want = carve_depth_for(m, r->len - t_exit);
+                      int delta, uint8_t vehicle_id, uint32_t time_ms, bool marked,
+                      int fine_depth) {
+    int want = carve_depth_for(m, r->len - t_exit, fine_depth);
 
     // Where the ray contradicts confident occupancy, resolve it properly even
     // in the far field. A grazing ray that clips the corner of a 2 m cell must
     // not be allowed to clear a wall it never actually passed through.
-    if (m->nodes[idx].log_odds >= m->occ_threshold) want = m->max_depth;
+    if (m->nodes[idx].log_odds >= m->occ_threshold) want = fine_depth;
 
     if (!marked && depth >= m->chunk_depth) {
         chunk_mark_dirty(m, octomap_chunk_key(m, cx, cy, cz));
@@ -497,7 +506,7 @@ static void carve_rec(octomap_t *m, uint32_t idx, int depth,
         if (!slab_clip(r, lo, hi, &a, &b)) continue;
         if (b <= a) continue;
         carve_rec(m, base + (uint32_t)i, depth + 1, cc[0], cc[1], cc[2], quarter,
-                  r, a, b, delta, vehicle_id, time_ms, marked);
+                  r, a, b, delta, vehicle_id, time_ms, marked, fine_depth);
     }
 }
 
@@ -525,12 +534,25 @@ void octomap_insert_ray(octomap_t *m, const om_ray_t *ray) {
     if (ray->hit) m->stats.hits_inserted++;
     else          m->stats.misses_inserted++;
 
+    // The cell the hit will own has to be decided before carving, because the
+    // carve must stop short of exactly that cell. Widen the endpoint with the
+    // sensor cone: a 25-degree sonar at 10 m is not a laser, and drawing it as
+    // one invents detail the sensor never had.
+    int hit_depth = m->max_depth;
+    if (ray->hit && ray->cone_radius_m > 0.0f) {
+        const double want = (double)ray->cone_radius_m * 2.0;
+        hit_depth = octomap_depth_for_size(m, want);
+        if (hit_depth > m->max_depth) hit_depth = m->max_depth;
+        if (hit_depth < m->coarse_depth) hit_depth = m->coarse_depth;
+    }
+
     // Skip the first stretch: that volume is the airframe, not the world.
     double t_start = m->skip_near_m;
-    // Never carve into the endpoint itself; stop a hair short of it so the hit
-    // update owns that cell.
-    const double leaf = octomap_cell_size(m, m->max_depth);
-    double t_end = len - (ray->hit ? leaf * 0.5 : 0.0);
+    // Stop short by a full hit cell, not half a leaf. Reaching into the cell
+    // the hit is about to claim debits every hit by a miss, which is how a
+    // surface observed once ends up never crossing the occupied threshold.
+    const double hit_cell = octomap_cell_size(m, hit_depth);
+    double t_end = len - (ray->hit ? hit_cell : 0.0);
     if (t_end > t_start) {
         carve_ray_t r;
         memcpy(r.o, ray->origin, sizeof(r.o));
@@ -544,21 +566,12 @@ void octomap_insert_ray(octomap_t *m, const om_ray_t *ray) {
         if (slab_clip(&r, lo, hi, &a, &b) && b > a) {
             carve_rec(m, 0, 0, 0.0, 0.0, 0.0, m->root_half, &r, a, b,
                       scale_delta(m->lo_miss, ray->weight), ray->vehicle_id,
-                      ray->time_ms, false);
+                      ray->time_ms, false, hit_depth);
         }
     }
 
     if (!ray->hit) return;   // a max-range reading is "no return", not a wall
 
-    // Widen the endpoint with the sensor cone: a 25-degree sonar at 10 m is not
-    // a laser, and drawing it as one invents detail the sensor never had.
-    int hit_depth = m->max_depth;
-    if (ray->cone_radius_m > 0.0f) {
-        const double want = (double)ray->cone_radius_m * 2.0;
-        hit_depth = octomap_depth_for_size(m, want);
-        if (hit_depth > m->max_depth) hit_depth = m->max_depth;
-        if (hit_depth < m->coarse_depth) hit_depth = m->coarse_depth;
-    }
     apply_point(m, ray->endpoint, hit_depth,
                 scale_delta(m->lo_hit, ray->weight), ray->vehicle_id, ray->time_ms);
 }
@@ -840,6 +853,36 @@ size_t octomap_snapshot(const octomap_t *m, void *buf, size_t buf_len) {
     return need;
 }
 
+// Walk a restored tree and re-register every chunk that holds content. The
+// snapshot carries only the node array, and the renderer discovers work solely
+// by enumerating chunks -- so without this a restored map draws as nothing.
+static void reindex_chunks(octomap_t *m, uint32_t idx, int depth,
+                           double cx, double cy, double cz, double half) {
+    if (depth >= m->chunk_depth) {
+        // Anything below here belongs to this chunk; register it if the subtree
+        // holds evidence at all.
+        om_agg_t a = { -128, 127, 0, 0, 0, 0 };
+        aggregate_rec(m, idx, &a);
+        if (a.lo_max >= m->occ_threshold || a.lo_min <= m->free_threshold)
+            chunk_mark_dirty(m, octomap_chunk_key(m, cx, cy, cz));
+        return;
+    }
+    if (!m->nodes[idx].children) {
+        // A leaf coarser than the chunk depth spans many chunks; the renderer
+        // handles that through the global flag rather than enumerating them.
+        if (m->nodes[idx].log_odds >= m->occ_threshold ||
+            m->nodes[idx].log_odds <= m->free_threshold) m->all_dirty = true;
+        return;
+    }
+    const double quarter = half * 0.5;
+    const uint32_t base = m->nodes[idx].children;
+    for (int i = 0; i < OM_NODES_PER_BLOCK; i++) {
+        double cc[3];
+        child_center(i, cx, cy, cz, quarter, cc);
+        reindex_chunks(m, base + (uint32_t)i, depth + 1, cc[0], cc[1], cc[2], quarter);
+    }
+}
+
 bool octomap_restore(octomap_t *m, const void *buf, size_t len) {
     if (!m || !buf || len < sizeof(om_snapshot_header_t)) return false;
     om_snapshot_header_t h;
@@ -859,5 +902,6 @@ bool octomap_restore(octomap_t *m, const void *buf, size_t len) {
     m->chunk_count = 0;
     m->dirty_count = 0;
     m->all_dirty = true;
+    reindex_chunks(m, 0, 0, 0.0, 0.0, 0.0, m->root_half);
     return true;
 }

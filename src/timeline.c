@@ -164,8 +164,8 @@ static void drop_stale_keyframes(timeline_t *tl) {
     tl->kf_count = keep;
 }
 
-void timeline_add_ray(timeline_t *tl, const om_ray_t *ray, int64_t t_ns) {
-    if (!tl || !ray || !tl->rays) return;
+uint64_t timeline_add_ray(timeline_t *tl, const om_ray_t *ray, int64_t t_ns) {
+    if (!tl || !ray || !tl->rays) return 0;
 
     tl_ray_t r;
     r.t_ns = t_ns;
@@ -183,7 +183,9 @@ void timeline_add_ray(timeline_t *tl, const om_ray_t *ray, int64_t t_ns) {
     if (cone_cm < 0.0f) cone_cm = 0.0f;
     if (cone_cm > 255.0f) cone_cm = 255.0f;
     r.cone_cm = (uint8_t)lrintf(cone_cm);
+    r.flags = 0;
 
+    const uint64_t seq = tl->ray_total;
     tl->rays[tl->ray_head] = r;
     tl->ray_head = (tl->ray_head + 1) & (tl->ray_cap - 1);
     if (tl->ray_count < tl->ray_cap) {
@@ -194,6 +196,15 @@ void timeline_add_ray(timeline_t *tl, const om_ray_t *ray, int64_t t_ns) {
     }
     tl->ray_total++;
     note_time(tl, t_ns);
+    return seq;
+}
+
+void timeline_mark_ray_skipped(timeline_t *tl, uint64_t seq) {
+    if (!tl || !tl->rays) return;
+    if (seq < tl->ray_oldest || seq >= tl->ray_total) return;   // already evicted
+    const uint32_t start = (tl->ray_head - tl->ray_count) & (tl->ray_cap - 1);
+    const uint32_t off = (uint32_t)(seq - tl->ray_oldest);
+    tl->rays[(start + off) & (tl->ray_cap - 1)].flags |= TL_RAY_SKIPPED;
 }
 
 // ---------------------------------------------------------------- query
@@ -303,9 +314,14 @@ int64_t timeline_map_history_start_ns(const timeline_t *tl) {
 
 void timeline_pin_live(timeline_t *tl) {
     if (!tl) return;
+    const bool was_scrubbed = !tl->playhead.pinned_to_head;
     tl->playhead.pinned_to_head = true;
     tl->playhead.paused = false;
     if (tl->have_span) tl->playhead.t_ns = tl->head_ns;
+    // The map is still showing whatever the scrub reconstructed. Invalidate it
+    // so the next sync rebuilds forward to the head; without this the map stays
+    // frozen in the past while the playhead reads live.
+    if (was_scrubbed) tl->map_valid = false;
 }
 
 void timeline_unpin(timeline_t *tl) {
@@ -444,9 +460,13 @@ uint32_t timeline_sync_map(timeline_t *tl, octomap_t *map) {
         const tl_ray_t *r = ray_by_lifetime_index(tl, tl->map_cursor);
         if (!r) break;
         if (r->t_ns > target) break;
-        replay_ray(map, r);
+        // A ray the queue shed never reached the live map, so replaying it
+        // would make the reconstruction denser than what was actually shown.
+        if (!(r->flags & TL_RAY_SKIPPED)) {
+            replay_ray(map, r);
+            replayed++;
+        }
         tl->map_cursor++;
-        replayed++;
     }
     tl->map_state_ns = target;
     return replayed;

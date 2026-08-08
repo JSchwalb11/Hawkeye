@@ -152,6 +152,7 @@ typedef struct {
     uint32_t half_nodes, end_nodes;
     uint32_t nodes_before_prune, nodes_after_prune;
     uint32_t blocks_reclaimed;
+    uint64_t prunes_total;        // blocks collapsed across the whole run
     double   rays_per_s;
     uint64_t rays_inserted, rays_dropped;
     uint64_t drop_events;
@@ -243,6 +244,7 @@ static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *
     rep->rays_per_s = elapsed > 0.0 ? (double)rep->rays_inserted / elapsed : 0.0;
     rep->peak_bytes = ms->map.stats.peak_bytes;
     rep->end_bytes = octomap_bytes(&ms->map);
+    rep->prunes_total = ms->map.stats.prunes;
     (void)t;
     return 0;
 }
@@ -402,6 +404,18 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
             bad += fail("drop events on timeline", 0.0, "<", 1.0);
     }
 
+    // An absolute ceiling on live nodes. The plateau ratio below cannot notice
+    // pruning being disabled -- the map simply grows uniformly and the ratio
+    // gets *better* -- so the run needs a bound it cannot grow through.
+    if (th->live_nodes_max > 0 && (int64_t)r->end_nodes > th->live_nodes_max)
+        bad += fail("live nodes", (double)r->end_nodes, ">", (double)th->live_nodes_max);
+
+    // And proof that pruning actually ran, rather than that the geometry
+    // happened to saturate.
+    if (th->prune_blocks_min > 0 && (int64_t)r->prunes_total < th->prune_blocks_min)
+        bad += fail("blocks pruned", (double)r->prunes_total, "<",
+                    (double)th->prune_blocks_min);
+
     // Memory must plateau, not climb. Live node count is the honest measure:
     // the byte figure only moves when the pool doubles, so a map that grows
     // steadily could sit at the same byte total for a long while.
@@ -438,6 +452,7 @@ static void print_report(const truth_t *t, const report_t *r) {
     printf("  nodes before/after     %u / %u  (%u blocks reclaimed)\n",
            r->nodes_before_prune, r->nodes_after_prune, r->blocks_reclaimed);
     printf("  live nodes half/end    %u / %u\n", r->half_nodes, r->end_nodes);
+    printf("  blocks pruned (run)    %llu\n", (unsigned long long)r->prunes_total);
     printf("  rays inserted/dropped  %llu / %llu  (%llu drop events)\n",
            (unsigned long long)r->rays_inserted, (unsigned long long)r->rays_dropped,
            (unsigned long long)r->drop_events);

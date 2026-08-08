@@ -40,8 +40,11 @@ bool fleet_frame_note_origin(fleet_frame_t *ff, uint8_t vehicle_id, uint8_t src,
     // it would put the session origin off the coast of Ghana.
     if (lat_deg == 0.0 && lon_deg == 0.0) return false;
 
+    // FLEET_ORIGIN_SRC_* run best-to-worst ascending, so a *smaller* value is a
+    // better source. Keep what we have only when it already came from something
+    // at least as authoritative.
     geo_origin_t *slot = &ff->vehicle[vehicle_id];
-    if (slot->valid && ff->vehicle_source[vehicle_id] > src) return false;
+    if (slot->valid && ff->vehicle_source[vehicle_id] < src) return false;
 
     if (!slot->valid) ff->vehicle_count++;
     geo_origin_set(slot, lat_deg, lon_deg, alt_m);
