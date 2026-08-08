@@ -233,6 +233,11 @@ static int prescan(data_source_t *ds, bin_impl_t *b) {
                                    (uint32_t)id, NULL);
             continue;
         }
+        // See the note in data_source_tlog.c: the queue sheds under pressure,
+        // which is right for a live link and wrong for a pre-pass that nothing
+        // is racing. Drain at a watermark so no ray is ever shed here.
+        if (b->ms->ingest.stats.queue_depth >= 16384u)
+            map_ingest_drain_all(&b->ms->ingest, &b->ms->map);
     }
     df_reader_close(&r);
 

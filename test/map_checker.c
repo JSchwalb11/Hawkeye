@@ -28,6 +28,7 @@
 #include "map_session.h"
 #include "mavlink_map_decode.h"
 #include "canvas.h"
+#include "splat.h"
 #include "ortho_render.h"
 #include "tlog.h"
 #include "truth.h"
@@ -38,9 +39,24 @@
 // not its centre, so a coarse cone-widened cell is not punished for being big.
 #define SURFACE_SLACK_M 0.60
 
+// The world under the map, whichever form the fixture used. Planes give an
+// exact distance; a splat cloud gives the distance to the nearest Gaussian
+// centre, which is the same quantity to within the splat spacing and is what
+// the cloud can honestly answer.
+typedef struct {
+    const geom_scene_t  *scene;
+    const splat_cloud_t *cloud;   // NULL unless the fixture ranged against one
+} world_t;
+
+static double world_distance(const world_t *w, double t_s, const double p[3]) {
+    if (w->cloud) return splat_distance(w->cloud, p);
+    return geom_scene_distance(w->scene, t_s, p);
+}
+
 typedef struct {
     const octomap_t *map;
     const truth_t   *t;
+    const world_t   *world;
     double           final_t_s;
 
     uint64_t occupied_cells, free_cells, unknown_cells;
@@ -91,7 +107,7 @@ static void scan_leaf(const om_leaf_t *leaf, void *user) {
 
     if (leaf->state != OM_OCCUPIED) return;
 
-    const double d = geom_scene_distance(&s->t->header.scene, s->final_t_s, leaf->center);
+    const double d = world_distance(s->world, s->final_t_s, leaf->center);
     double err = d - leaf->size * 0.5;
     if (err < 0.0) err = 0.0;
     if (d < 1e17) {
@@ -104,7 +120,8 @@ static void scan_leaf(const om_leaf_t *leaf, void *user) {
         s->false_occupied++;
     }
 
-    const double dv = distance_to_vanished(&s->t->header.scene, s->final_t_s, leaf->center);
+    const double dv = s->world->cloud ? 1e18
+        : distance_to_vanished(&s->t->header.scene, s->final_t_s, leaf->center);
     if (dv < 1e17 && dv - leaf->size * 0.5 <= SURFACE_SLACK_M && err > SURFACE_SLACK_M)
         s->vanished_occupied++;
 
@@ -174,6 +191,16 @@ typedef struct {
     double   solo_surface_best;
     int      solo_surface_best_id;
     uint64_t surface_samples;
+    bool     world_has_surface;
+    // Shape agreement between the map and the world, voxelised at the map's
+    // own leaf size over the world's bounding box.
+    double   shape_iou, shape_precision, shape_recall, shape_voxel_m;
+    // Coverage of the whole cloud, reported for context: surfaces no exterior
+    // orbit can reach are in this denominator and not in the reference.
+    double   cloud_recall;
+    double   shape_precision_near;
+    uint64_t cloud_voxels;
+    uint64_t shape_world_voxels, shape_map_voxels, shape_shared_voxels;
 } report_t;
 
 static void configure_session(map_session_t *ms, const truth_t *t) {
@@ -262,11 +289,18 @@ static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *
     return 0;
 }
 
-static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
+static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
+                    report_t *rep) {
+    const world_t world = *w;
+    rep->world_has_surface = world.cloud
+        ? (world.cloud->count > 0)
+        : scene_has_active(&t->header.scene, t->header.duration_s);
+
     scan_t s;
     memset(&s, 0, sizeof(s));
     s.map = &ms->map;
     s.t = t;
+    s.world = &world;
     s.final_t_s = t->header.duration_s;
 
     octomap_iterate(&ms->map, scan_leaf, &s);
@@ -321,7 +355,7 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
         for (int k = 0; k < 3; k++) d[k] /= len;
 
         if (ray->hit) {
-            const double dist = geom_scene_distance(&t->header.scene, s.final_t_s, end);
+            const double dist = world_distance(&world, s.final_t_s, end);
             if (dist <= leaf * 2.0) {
                 // A surface counts as represented when the map holds occupancy
                 // within one cell of it. Which side of a cell boundary the hit
@@ -374,6 +408,146 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
         ? (double)surf_free / (double)(surf_free + surf_occ) : 0.0;
     rep->coverage = swept ? (double)observed / (double)swept : 0.0;
 
+    // --- Does the map look like the thing it mapped? ---------------------
+    //
+    // Surface RMS says every occupied cell is near the object. It does not say
+    // the object is there: a map holding one correct cell scores a perfect RMS.
+    // Intersection over union over voxels says both at once, because both sides
+    // are voxelised on the same lattice and compared set against set.
+    //
+    // The reference is the *observable* envelope, not the whole cloud. A drone
+    // orbiting outside cannot see the underside of the base, the inside of the
+    // robe, or the back of the tablet, and scoring against surfaces no flight
+    // could reach would make the metric a statement about the mesh rather than
+    // about the map. A voxel joins the reference when it holds a splat centre
+    // *and* an injector ray genuinely terminated in it -- the injector's rays,
+    // not the map's cells, so nothing here is circular.
+    //
+    // Precision keeps the other half honest: its denominator is every occupied
+    // voxel in the region, so a cell the map invented in clear air counts
+    // against it whether or not the reference reaches there.
+    if (world.cloud) {
+        const double vox = t->header.thresholds.shape_voxel_m > 0.0
+            ? t->header.thresholds.shape_voxel_m
+            : octomap_cell_size(&ms->map, ms->map.max_depth);
+        const double margin = 6.0;
+        double blo[3], bhi[3];
+        int dim[3];
+        size_t cells = 1;
+        for (int k = 0; k < 3; k++) {
+            blo[k] = world.cloud->lo[k] - margin;
+            bhi[k] = world.cloud->hi[k] + margin;
+            dim[k] = (int)((bhi[k] - blo[k]) / vox) + 1;
+            cells *= (size_t)dim[k];
+        }
+
+        const double leaf_m = octomap_cell_size(&ms->map, ms->map.max_depth);
+        int sub = (int)(vox / leaf_m + 0.5);
+        if (sub < 1) sub = 1;
+        if (sub > 8) sub = 8;
+        const double step = vox / (double)sub;
+
+        uint8_t *lat = (uint8_t *)calloc(cells, 1);
+        if (lat) {
+            #define LAT_WORLD    0x01
+            #define LAT_OBSERVED 0x02
+            #define LAT_MAP      0x04
+            #define LAT_NEAR     0x08
+
+            // Which voxels an injector ray actually terminated in.
+            for (uint32_t i = 0; i < t->ray_count; i++) {
+                if (!t->rays[i].hit) continue;
+                int c[3]; bool ok = true;
+                for (int k = 0; k < 3; k++) {
+                    c[k] = (int)((t->rays[i].endpoint[k] - blo[k]) / vox);
+                    if (c[k] < 0 || c[k] >= dim[k]) ok = false;
+                }
+                if (ok) lat[((size_t)c[2] * dim[1] + c[1]) * dim[0] + c[0]] |= LAT_OBSERVED;
+            }
+
+            // Which voxels the world puts surface in, and which the map does.
+            for (int iz = 0; iz < dim[2]; iz++)
+            for (int iy = 0; iy < dim[1]; iy++)
+            for (int ix = 0; ix < dim[0]; ix++) {
+                const size_t g = ((size_t)iz * dim[1] + iy) * dim[0] + ix;
+                const double p[3] = { blo[0] + (ix + 0.5) * vox,
+                                      blo[1] + (iy + 0.5) * vox,
+                                      blo[2] + (iz + 0.5) * vox };
+                if (splat_cell_occupied(world.cloud, p, vox)) lat[g] |= LAT_WORLD;
+                // Sub-sample the map at its own leaf size. Asking only at the
+                // voxel centre would be asymmetric: the world side tests the
+                // whole cell, and the map's surface is a shell one leaf thick,
+                // so a centre-only test measures how often a thin shell passes
+                // through an exact point rather than whether the map holds the
+                // surface at all.
+                for (int sz = 0; sz < sub && !(lat[g] & LAT_MAP); sz++)
+                for (int sy = 0; sy < sub && !(lat[g] & LAT_MAP); sy++)
+                for (int sx = 0; sx < sub && !(lat[g] & LAT_MAP); sx++) {
+                    const double q[3] = {
+                        blo[0] + ix * vox + (sx + 0.5) * step,
+                        blo[1] + iy * vox + (sy + 0.5) * step,
+                        blo[2] + iz * vox + (sz + 0.5) * step };
+                    if (octomap_query(&ms->map, q[0], q[1], q[2]) == OM_OCCUPIED)
+                        lat[g] |= LAT_MAP;
+                }
+            }
+
+            // A one-voxel dilation of the world, used only as precision's
+            // target. The sensor's own footprint is about a metre at this
+            // standoff, so a cell placed one voxel off the surface is the beam
+            // width showing, not an invention -- the same allowance
+            // SURFACE_SLACK_M makes when scoring against planes.
+            for (int iz = 0; iz < dim[2]; iz++)
+            for (int iy = 0; iy < dim[1]; iy++)
+            for (int ix = 0; ix < dim[0]; ix++) {
+                const size_t g = ((size_t)iz * dim[1] + iy) * dim[0] + ix;
+                if (!(lat[g] & LAT_WORLD)) continue;
+                for (int dz = -1; dz <= 1; dz++)
+                for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
+                    if (jx < 0 || jy < 0 || jz < 0 ||
+                        jx >= dim[0] || jy >= dim[1] || jz >= dim[2]) continue;
+                    lat[((size_t)jz * dim[1] + jy) * dim[0] + jx] |= LAT_NEAR;
+                }
+            }
+
+            uint64_t obs_total = 0, obs_hit = 0;
+            uint64_t map_total = 0, map_near = 0;
+            uint64_t world_total = 0, world_hit = 0, strict_union = 0;
+            for (size_t g = 0; g < cells; g++) {
+                const bool w = (lat[g] & LAT_WORLD) != 0;
+                const bool obs = w && (lat[g] & LAT_OBSERVED);
+                const bool mapd = (lat[g] & LAT_MAP) != 0;
+                if (obs) { obs_total++; if (mapd) obs_hit++; }
+                if (mapd) { map_total++; if (lat[g] & LAT_NEAR) map_near++; }
+                if (w) { world_total++; if (mapd) world_hit++; }
+                if (w || mapd) strict_union++;
+            }
+            rep->shape_voxel_m = vox;
+            rep->shape_shared_voxels = obs_hit;
+            rep->shape_world_voxels = obs_total;
+            rep->shape_map_voxels = map_total;
+            // Recall: did the map keep what the drones actually looked at?
+            rep->shape_recall = obs_total ? (double)obs_hit / (double)obs_total : 0.0;
+            // Precision: is what the map holds really the statue? Reported
+            // strictly -- a voxel counts only if the world puts surface in that
+            // same voxel. The within-one-voxel figure beside it is the same
+            // question asked with the sensor's own footprint as tolerance;
+            // the strict one is asserted because a tolerance of a full metre
+            // saturates at 1.0 and then says nothing.
+            rep->shape_precision = map_total ? (double)world_hit / (double)map_total : 0.0;
+            rep->shape_precision_near = map_total ? (double)map_near / (double)map_total : 0.0;
+            // IoU: strict, against the whole cloud, reported for context. It is
+            // bounded above by observability -- an exterior orbit cannot reach
+            // the inside of the robe -- so it is not the number to assert on.
+            rep->shape_iou = strict_union ? (double)world_hit / (double)strict_union : 0.0;
+            rep->cloud_voxels = world_total;
+            rep->cloud_recall = world_total ? (double)world_hit / (double)world_total : 0.0;
+            free(lat);
+        }
+    }
+
     rep->surface_samples = surface_total;
     if (surface_total) {
         rep->merged_surface = (double)merged_hit / (double)surface_total;
@@ -421,7 +595,7 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
     const truth_thresholds_t *th = &t->header.thresholds;
     int bad = 0;
 
-    if (scene_has_active(&t->header.scene, t->header.duration_s)) {
+    if (r->world_has_surface) {
         if (th->surface_rms_max_m > 0.0 && r->surface_rms > th->surface_rms_max_m)
             bad += fail("surface RMS (m)", r->surface_rms, ">", th->surface_rms_max_m);
         if (r->false_occupied_rate > th->false_occupied_max)
@@ -479,6 +653,13 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
                r->solo_surface_best_id);
         bad++;
     }
+
+    if (th->shape_iou_min > 0.0 && r->shape_iou < th->shape_iou_min)
+        bad += fail("shape IoU", r->shape_iou, "<", th->shape_iou_min);
+    if (th->shape_recall_min > 0.0 && r->shape_recall < th->shape_recall_min)
+        bad += fail("shape recall", r->shape_recall, "<", th->shape_recall_min);
+    if (th->shape_precision_min > 0.0 && r->shape_precision < th->shape_precision_min)
+        bad += fail("shape precision", r->shape_precision, "<", th->shape_precision_min);
 
     if (th->cone_ratio_min > 0.0 && r->cone_ratio < th->cone_ratio_min)
         bad += fail("cone size ratio", r->cone_ratio, "<", th->cone_ratio_min);
@@ -545,6 +726,19 @@ static void print_report(const truth_t *t, const report_t *r) {
         printf("  worst-group false-free %.5f  (group %d of %d scored)\n",
                r->group_worst_false_free, r->group_worst_id, r->group_scored);
     printf("  coverage completeness  %.5f\n", r->coverage);
+    if (r->shape_world_voxels) {
+        printf("  shape recall           %.5f  (%llu of %llu observed voxels kept)\n",
+               r->shape_recall, (unsigned long long)r->shape_shared_voxels,
+               (unsigned long long)r->shape_world_voxels);
+        printf("  shape precision        %.5f strict / %.5f within one voxel"
+               "  (of %llu occupied)\n",
+               r->shape_precision, r->shape_precision_near,
+               (unsigned long long)r->shape_map_voxels);
+        printf("  shape IoU (strict)     %.5f  at a %.2f m lattice\n",
+               r->shape_iou, r->shape_voxel_m);
+        printf("  whole-cloud coverage   %.5f  of %llu voxels, observable or not\n",
+               r->cloud_recall, (unsigned long long)r->cloud_voxels);
+    }
     if (t->header.thresholds.merged_surface_min > 0.0 ||
         t->header.thresholds.solo_surface_max > 0.0) {
         printf("  surface samples        %llu\n",
@@ -646,7 +840,8 @@ static int run_listen(const truth_t *t, int port, double seconds,
 
     report_t rep;
     memset(&rep, 0, sizeof(rep));
-    measure(&ms, t, &rep);
+    const world_t wire_world = { &t->header.scene, NULL };
+    measure(&ms, t, &wire_world, &rep);
     printf("wire smoke: %llu frames, %llu occupied cells, surface RMS %.4f m\n",
            (unsigned long long)frames, (unsigned long long)rep.occupied_cells, rep.surface_rms);
 
@@ -828,6 +1023,22 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    // If the fixture ranged against a splat world, load the identical file.
+    // The checker is not told where the surfaces are; it reads the same world
+    // the injector did and re-derives nothing.
+    splat_cloud_t cloud;
+    memset(&cloud, 0, sizeof(cloud));
+    world_t world = { &truth.header.scene, NULL };
+    if (truth.header.splat_path[0]) {
+        if (splat_load(&cloud, truth.header.splat_path, err, sizeof(err)) != 0) {
+            fprintf(stderr, "splat world: %s\n", err);
+            truth_free(&truth);
+            return 1;
+        }
+        world.cloud = &cloud;
+        printf("splat world: %u gaussians from %s\n", cloud.count, truth.header.splat_path);
+    }
+
     map_session_t ms;
     configure_session(&ms, &truth);
 
@@ -838,7 +1049,7 @@ int main(int argc, char **argv) {
         truth_free(&truth);
         return 1;
     }
-    measure(&ms, &truth, &rep);
+    measure(&ms, &truth, &world, &rep);
     print_report(&truth, &rep);
 
     if (render_path) {
@@ -852,6 +1063,7 @@ int main(int argc, char **argv) {
     if (bad == 0) printf("  PASS  all thresholds met\n");
 
     map_session_free(&ms);
+    splat_free(&cloud);
     truth_free(&truth);
     return bad ? 1 : 0;
 }

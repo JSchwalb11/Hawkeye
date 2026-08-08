@@ -12,6 +12,7 @@ add_library(hawkeye-fixture-support STATIC
     orientation_basis.c
     canvas.c
     ortho_render.c
+    splat.c
 )
 target_include_directories(hawkeye-fixture-support PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(hawkeye-fixture-support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
@@ -55,12 +56,22 @@ set(HAWKEYE_FIXTURES
     firehose
     endurance
     cooperative
+    statue-solo
+    statue-fleet
 )
+
+# The statue fixtures range against a Gaussian splat rather than against
+# planes, so they need the asset. Everything else ignores it.
+set(STATUE_SPLAT ${CMAKE_SOURCE_DIR}/assets/statue_of_liberty.splat)
 
 foreach(fixture ${HAWKEYE_FIXTURES})
     set(fixture_scale 1)
     if(fixture STREQUAL "firehose")
         set(fixture_scale ${HAWKEYE_FIXTURE_FIREHOSE_SCALE})
+    endif()
+    set(fixture_splat "")
+    if(fixture MATCHES "^statue-")
+        set(fixture_splat ${STATUE_SPLAT})
     endif()
     add_test(NAME fixture_${fixture}
         COMMAND ${CMAKE_COMMAND}
@@ -68,6 +79,7 @@ foreach(fixture ${HAWKEYE_FIXTURES})
             -DCHECKER=$<TARGET_FILE:map_checker>
             -DFIXTURE=${fixture}
             -DSCALE=${fixture_scale}
+            -DSPLAT=${fixture_splat}
             -DWORKDIR=${FIXTURE_WORKDIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/run_fixture.cmake)
     set_tests_properties(fixture_${fixture} PROPERTIES TIMEOUT 600)

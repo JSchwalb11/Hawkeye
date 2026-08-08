@@ -128,6 +128,11 @@ static void state_apply(data_source_t *ds, tlog_impl_t *t, const mavlink_message
     }
 }
 
+// Half the default queue. Draining at a watermark rather than every frame
+// keeps the batching that makes insertion cheap, while guaranteeing the queue
+// never reaches the point where it would start shedding.
+#define PRESCAN_DRAIN_WATERMARK 16384u
+
 // Feed the whole log into the shared map exactly once.
 static void prescan(data_source_t *ds, tlog_impl_t *t) {
     if (!t->ms) return;
@@ -140,6 +145,14 @@ static void prescan(data_source_t *ds, tlog_impl_t *t) {
     while (tlog_reader_next(&r, (struct __mavlink_message *)&msg, &arrival) == 1) {
         mavlink_map_decode(t->ms, t->slot, (struct __mavlink_message *)&msg, arrival);
         t->frames_total++;
+        // Drain as we go. The queue is deliberately bounded and sheds its
+        // oldest under pressure -- which is right for a live link that has
+        // fallen behind, and wrong here: nothing is racing us, and feeding a
+        // whole log in before draining once would silently discard every ray
+        // past the queue's capacity. A four-vehicle log of any length loses
+        // most of its map that way.
+        if (t->ms->ingest.stats.queue_depth >= PRESCAN_DRAIN_WATERMARK)
+            map_ingest_drain_all(&t->ms->ingest, &t->ms->map);
     }
     t->rays_from_log = t->ms->timeline.ray_total - rays_before;
     tlog_reader_close(&r);

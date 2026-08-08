@@ -18,9 +18,14 @@ file(MAKE_DIRECTORY "${WORKDIR}")
 set(TLOG "${WORKDIR}/${FIXTURE}.tlog")
 set(TRUTH "${WORKDIR}/${FIXTURE}.truth")
 
+set(SPLAT_ARGS)
+if(DEFINED SPLAT AND NOT SPLAT STREQUAL "")
+    set(SPLAT_ARGS --splat "${SPLAT}")
+endif()
+
 execute_process(
     COMMAND "${INJECTOR}" --fixture "${FIXTURE}" --tlog "${TLOG}" --truth "${TRUTH}"
-            --seed "${SEED}" --scale "${SCALE}"
+            --seed "${SEED}" --scale "${SCALE}" ${SPLAT_ARGS}
     RESULT_VARIABLE inject_rc
     OUTPUT_VARIABLE inject_out
     ERROR_VARIABLE  inject_err)

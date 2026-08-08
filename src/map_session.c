@@ -315,12 +315,24 @@ void map_session_tick_at(map_session_t *ms, int64_t want_ns, float dt_s) {
     // which is the point, and is how replay gets keyframes and the
     // don't-insert-while-scrubbed rule for free.
     if (!ms->timeline.have_span) return;
-    if (want_ns >= ms->timeline.head_ns) {
-        // The transport is at the frontier of what has been fed. That is
-        // exactly what "live" means here, whatever the wall clock says.
+
+    // Playing forward or seeking? Not "is the transport past the newest ray" --
+    // the transport's position and a ray's timestamp come from different clocks
+    // (a file offset against a timebase-resolved stamp), so they disagree by a
+    // little at all times and the answer would flap every frame. Flapping into
+    // the scrubbed branch discards the queue, which is how a straight replay
+    // came to shed most of its rays.
+    //
+    // Monotonic progress is playback. A jump backwards is a seek.
+    const int64_t prev = ms->replay_want_ns;
+    const bool seeked = ms->have_replay_want && want_ns < prev - TL_SEEK_EPSILON_NS;
+    ms->replay_want_ns = want_ns;
+    ms->have_replay_want = true;
+
+    if (!seeked) {
         if (!ms->timeline.playhead.pinned_to_head) timeline_pin_live(&ms->timeline);
         else ms->timeline.playhead.t_ns = ms->timeline.head_ns;
-    } else if (want_ns != ms->timeline.playhead.t_ns) {
+    } else {
         timeline_set_playhead(&ms->timeline, want_ns);
     }
 

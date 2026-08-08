@@ -72,6 +72,7 @@ static void print_usage(const char *prog) {
     printf("  --follow-map           Aim the camera at the map, not the aircraft\n");
     printf("  --map-mode <mode>      occupancy, coverage, divergence, contribution\n");
     printf("  --focus <n>            Focus vehicle n (0-based) for contribution\n");
+    printf("  --map-hide-free        Draw occupied cells only, not carved space\n");
 }
 
 /* Thin wrapper: delegates to the testable inline in ui_logic.h */
@@ -252,6 +253,7 @@ int main(int argc, char *argv[]) {
     ortho_mode_t start_view = ORTHO_NONE;
     const char *start_map_mode = NULL;   // occupancy | coverage | divergence | contribution
     int    start_focus = -1;
+    bool   hide_free = false;
     double view_span_m = 0.0;      // 0 = fit to the map
     bool   follow_map = false;
 
@@ -331,6 +333,8 @@ int main(int argc, char *argv[]) {
             start_map_mode = argv[++i];
         } else if (strcmp(argv[i], "--focus") == 0 && i + 1 < argc) {
             start_focus = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--map-hide-free") == 0) {
+            hide_free = true;
         } else if (strcmp(argv[i], "--view") == 0 && i + 1 < argc) {
             const char *v = argv[++i];
             if      (strcmp(v, "top") == 0)    start_view = ORTHO_TOP;
@@ -736,6 +740,30 @@ int main(int argc, char *argv[]) {
     bool show_marker_labels = true;
     marker_input_t marker_input = {0};
     marker_input.target = -1;
+
+    if (map_render_ready) {
+        // Framing an unattended capture: the same switches the operator has on
+        // the keyboard, so a recording can show any of the map views.
+        if (start_map_mode) {
+            bool matched = false;
+            for (int m = 0; m < MAP_DRAW_MODE_COUNT; m++) {
+                if (strcmp(start_map_mode, map_draw_mode_name((map_draw_mode_t)m)) == 0) {
+                    map_render.mode = (map_draw_mode_t)m;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                fprintf(stderr, "hawkeye: unknown --map-mode %s (try:", start_map_mode);
+                for (int m = 0; m < MAP_DRAW_MODE_COUNT; m++)
+                    fprintf(stderr, " %s", map_draw_mode_name((map_draw_mode_t)m));
+                fprintf(stderr, ")\n");
+                return 1;
+            }
+        }
+        if (hide_free) map_render.show_free = false;
+    }
+    if (start_focus >= 0 && map_ready) map_session_set_focus(&map_session, start_focus);
 
     if (start_view != ORTHO_NONE) {
         scene.ortho_mode = start_view;

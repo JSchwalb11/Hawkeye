@@ -88,6 +88,11 @@ typedef struct {
     int           focus_vehicle;      // -1 = none
     int           solo_vehicle;       // -1 = none
 
+    // Last transport position handed to map_session_tick_at, so playback can be
+    // told from a seek without comparing two clocks that never quite agree.
+    int64_t       replay_want_ns;
+    bool          have_replay_want;
+
     uint64_t      last_reported_drops;
     bool          enabled;            // false suspends map building entirely
 } map_session_t;
@@ -136,6 +141,11 @@ void map_session_feed_event(map_session_t *ms, int slot, int64_t t_ns,
 // Drain the ray queue into the map, take keyframes, and keep the playhead in
 // step. Call once per frame with the wall-clock delta.
 void map_session_tick(map_session_t *ms, float dt_s);
+
+// A backwards jump smaller than this is transport jitter, not a seek. Two
+// hundred milliseconds is far below any deliberate scrub and far above the
+// disagreement between a file offset and a timebase-resolved stamp.
+#define TL_SEEK_EPSILON_NS 200000000LL
 
 // The same work, but with the playhead set from outside instead of advanced
 // by dt_s. Replay uses this so the transport stays the single authority on

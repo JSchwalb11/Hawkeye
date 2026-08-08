@@ -1,0 +1,125 @@
+# Mapping an object: the Statue of Liberty fixtures
+
+Every fixture before these ranged against analytic planes. Planes are the right
+model for walls and floors and they make the error analysis exact — but they
+cannot answer the one question an operator actually asks of a map, which is
+*does this look like the thing we flew around*. Every plane looks like every
+other plane.
+
+So two fixtures range against a Gaussian splat of the Statue of Liberty
+instead, and score the resulting map for shape as well as for error.
+
+![statue-fleet](../assets/fleet-map/statue-fleet.png)
+
+## What the world is
+
+`assets/statue_of_liberty.splat` is a 40,000-Gaussian cloud in the standard
+32-bytes-per-splat layout (position `f32×3`, scale `f32×3`, colour `u8×4`,
+rotation quaternion `u8×4`) that any splat viewer reads. It is 93 m tall — the
+real statue including its pedestal — and 43 m across at the star base.
+
+**Provenance, stated plainly:** it is a splat *baked from a mesh*, not a
+photogrammetric capture. `tools/bake_splat.py` area-weighted-samples a triangle
+mesh and writes one anisotropic Gaussian per sample, flattened along the local
+surface normal by 6:1, which is what a splat trained on a solid object
+converges to. The source mesh is `statue_of_liberty.obj` from
+[leihui6/BENBV](https://github.com/leihui6/BENBV) (MIT). Its shape fidelity is
+the mesh's, not a camera's. Regenerate with:
+
+```
+tools/bake_splat.py statue_of_liberty.obj assets/statue_of_liberty.splat \
+    --height 93 --count 40000
+```
+
+`test/splat.c` loads it and ray-casts against the Gaussians: composite front to
+back along the ray, and take the depth where accumulated opacity first passes
+`SPLAT_SURFACE_ALPHA`. That threshold is 0.25, not the 0.5 of the rendering
+convention, and the difference matters — at 0.5 a ray grazing the silhouette
+never accumulates half its opacity, comes back a no-return, and the fixture
+then carves free space straight through solid statue.
+
+**Nothing about splats reaches the viewer.** `src/` has no idea they exist. The
+injector ray-casts against the Gaussians and emits ordinary
+`OBSTACLE_DISTANCE` over the wire, so the ingest path under test is the real
+one. `no_fixture_symbols` still passes.
+
+## The two fixtures
+
+Both fly the fan on its side: rolling 90° turns `OBSTACLE_DISTANCE`'s
+horizontal sweep into a vertical one, so a single orbit paints the statue top
+to bottom instead of ringing it at one altitude. Nothing about the message
+changes — the frame is still `BODY_FRD` and the viewer resolves it through
+attitude, which is precisely the path this exercises. The fan is 72 sectors of
+1.7° (`increment_f`, which is why that field is a float), a ~1 m footprint at
+the 34 m standoff.
+
+**`statue-solo`** — one drone, four orbits in 120 s while climbing from 10 m to
+82 m. It can see every side given time, so its map is expected to resemble the
+statue outright.
+
+**`statue-fleet`** — four drones, each pinned to its own 90° sector, each on
+its own GPS origin, 60 s. The statue occludes itself, so nothing any of them
+does gets them round the back: the partition is enforced by the world, not just
+by the flight plan.
+
+## How "resembles the statue" is measured
+
+Surface RMS says every occupied cell is near the object. It does not say the
+object is *there* — a map holding one correct cell scores a perfect RMS. So the
+map and the world are both voxelised on a 1 m lattice and compared set against
+set. The lattice is coarser than the 0.25 m leaf on purpose: below about 0.7 m
+the reference cloud's own 0.34 m splat spacing and the sensor's cone footprint
+dominate, and a finer lattice would be measuring those rather than the map.
+
+- **recall** — of the voxels an injector ray genuinely terminated in, how many
+  does the map hold? The reference is the *observable* envelope rather than the
+  whole cloud, because a drone orbiting outside cannot see the underside of the
+  base or the inside of the robe, and scoring against surfaces no flight could
+  reach would make the metric a statement about the mesh. It is built from the
+  injector's rays, not the map's cells, so nothing is circular.
+- **precision** — of the map's occupied voxels, how many does the world put
+  surface in? Reported strictly, with the within-one-voxel figure beside it;
+  the strict one is asserted because a full metre of tolerance saturates at
+  1.000 and then says nothing.
+- **whole-cloud coverage** — context, including surfaces no orbit can reach.
+
+| | solo | fleet |
+| --- | --- | --- |
+| surface RMS | 0.279 m | 0.315 m |
+| false-occupied | 0.057 | 0.073 |
+| shape recall | 0.855 | 0.915 |
+| shape precision (strict / ±1 voxel) | 0.705 / 1.000 | 0.676 / 0.999 |
+| whole-cloud coverage | 0.633 | 0.769 |
+| merged surface | — | 0.915 |
+| best single drone alone | — | 0.344 |
+
+The fleet reaches more of the statue in half the time, and no single drone
+accounts for more than a third of the observed surface. That is the cooperative
+claim on a real object rather than on a box.
+
+## Watching it happen
+
+`statue-fleet` replayed through the viewer, front orthographic, free space
+hidden, captured headless under Xvfb:
+
+![statue-fleet-build](../assets/fleet-map/statue-fleet-build.gif)
+
+```
+xvfb-run -s "-screen 0 1000x680x24" hawkeye \
+    --tlog statue-fleet.tlog --view front --view-span 110 \
+    --map-hide-free --capture-gif build.gif --capture-fps 1.6 --exit-after 60
+```
+
+The viewer's instanced 3D view is sparser than the checker's orthographic
+projection of the same map: it draws cubes at LOD with a per-frame extraction
+budget of 24 chunks and frustum culling, so on a map this size it is still
+working through its backlog while the log plays. The map itself is complete —
+`RAYS DROPPED` reads 0 and the checker scores it as above.
+
+## What these fixtures cannot tell you
+
+The cloud's splat spacing is 0.34 m and the sensor footprint is about 1 m, so
+these fixtures verify decimetre work. They cannot verify centimetre work: you
+cannot check a map to a tolerance finer than the world you check it against.
+Doing that would mean scoring against the source triangles with exact
+point-triangle distance and keeping the splat only as what the *sensor* sees.

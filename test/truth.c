@@ -61,6 +61,12 @@ int truth_writer_finish(truth_writer_t *w, const truth_header_t *h) {
             h->root_size_m, h->max_depth, h->coarse_depth, h->skip_near_m,
             h->queue_capacity, h->budget_per_drain, (unsigned long long)h->map_byte_cap);
 
+    if (h->splat_path[0]) {
+        fprintf(f, "  \"splat\": {\"path\": \"%s\", ", h->splat_path);
+        write_vec(f, "origin_enu", h->splat_origin_enu);
+        fprintf(f, "},\n");
+    }
+
     fprintf(f, "  \"vehicles\": [\n");
     for (int i = 0; i < h->vehicle_count; i++) {
         const truth_vehicle_t *v = &h->vehicles[i];
@@ -109,7 +115,11 @@ int truth_writer_finish(truth_writer_t *w, const truth_header_t *h) {
     fprintf(f, "    \"group_false_free_max\": %.9g,\n", t->group_false_free_max);
     fprintf(f, "    \"group_min_rays\": %d,\n", t->group_min_rays);
     fprintf(f, "    \"merged_surface_min\": %.9g,\n", t->merged_surface_min);
-    fprintf(f, "    \"solo_surface_max\": %.9g\n", t->solo_surface_max);
+    fprintf(f, "    \"solo_surface_max\": %.9g,\n", t->solo_surface_max);
+    fprintf(f, "    \"shape_iou_min\": %.9g,\n", t->shape_iou_min);
+    fprintf(f, "    \"shape_recall_min\": %.9g,\n", t->shape_recall_min);
+    fprintf(f, "    \"shape_precision_min\": %.9g,\n", t->shape_precision_min);
+    fprintf(f, "    \"shape_voxel_m\": %.9g\n", t->shape_voxel_m);
     fprintf(f, "  }\n}\n");
 
     fclose(f);
@@ -207,6 +217,15 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         h->map_byte_cap     = (size_t)key_num(mp, "byte_cap", 0);
     }
 
+    // A splat world, if the fixture used one.
+    {
+        const char *sp = strstr(buf, "\"splat\"");
+        if (sp) {
+            key_str(sp, "path", h->splat_path, sizeof(h->splat_path));
+            read_vec3(find_key(sp, "origin_enu"), h->splat_origin_enu);
+        }
+    }
+
     // Vehicles.
     const char *p = strstr(buf, "\"vehicles\"");
     if (p) {
@@ -283,6 +302,10 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         x->group_min_rays       = (int)key_num(th, "group_min_rays", 0);
         x->merged_surface_min   = key_num(th, "merged_surface_min", 0.0);
         x->solo_surface_max     = key_num(th, "solo_surface_max", 0.0);
+        x->shape_iou_min        = key_num(th, "shape_iou_min", 0.0);
+        x->shape_recall_min     = key_num(th, "shape_recall_min", 0.0);
+        x->shape_precision_min  = key_num(th, "shape_precision_min", 0.0);
+        x->shape_voxel_m        = key_num(th, "shape_voxel_m", 0.0);
     }
     free(buf);
 

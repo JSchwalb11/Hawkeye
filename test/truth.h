@@ -78,6 +78,19 @@ typedef struct {
     // ceiling on the second proves only that somebody mapped it.
     double  merged_surface_min;     // 0 = unchecked
     double  solo_surface_max;       // 0 = unchecked
+    // Does the map look like the thing it mapped? Intersection over union
+    // between the map's occupied cells and the world voxelised at the same
+    // resolution. A silhouette that is merely *near* the object scores well on
+    // surface RMS and badly here, which is the point.
+    double  shape_iou_min;          // 0 = unchecked
+    double  shape_recall_min;       // share of the observed envelope the map keeps
+    double  shape_precision_min;    // share of the map's voxels that are on the object
+    // Side of the comparison lattice. Both the map and the world are voxelised
+    // on it, so the score is between two sets of the same cells. It is coarser
+    // than the map's leaf on purpose: below about 0.7 m the reference cloud's
+    // own splat spacing and the sensor's cone footprint dominate, and a finer
+    // lattice would measure those rather than the map's fidelity. 0 = leaf.
+    double  shape_voxel_m;
 } truth_thresholds_t;
 
 typedef struct {
@@ -99,6 +112,12 @@ typedef struct {
     int     vehicle_count;
 
     geom_scene_t scene;
+
+    // A splat world, when the fixture ranged against one instead of planes.
+    // The checker loads the identical file rather than being told the answer,
+    // so the world the map is scored against is the world it was built from.
+    char     splat_path[384];
+    double   splat_origin_enu[3];
 
     // Map configuration the checker must reproduce for the numbers to mean
     // anything.

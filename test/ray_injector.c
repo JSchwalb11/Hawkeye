@@ -34,6 +34,7 @@
 #include "geo.h"
 #include "geom.h"
 #include "orientation_basis.h"
+#include "splat.h"
 #include "tlog.h"
 #include "truth.h"
 
@@ -56,7 +57,8 @@
 typedef enum {
     FX_EMPTY = 0, FX_GROUND, FX_WALL, FX_CORRIDOR, FX_ORIENTATIONS, FX_MOVING,
     FX_TWO_ORIGINS, FX_DISAGREEMENT, FX_VANISHING, FX_CONE, FX_WEAK,
-    FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_COOPERATIVE, FX_COUNT
+    FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_COOPERATIVE,
+    FX_STATUE_SOLO, FX_STATUE_FLEET, FX_COUNT
 } fixture_id_t;
 
 typedef enum { SENSOR_DISTANCE, SENSOR_OBSTACLE } sensor_kind_t;
@@ -74,6 +76,10 @@ typedef struct {
     // Publish every Nth ray. The long fixtures cast millions; scoring them is
     // statistical, and a 44 MB sidecar in CI helps nobody.
     uint32_t      truth_ray_stride;
+    // Range against a Gaussian splat cloud instead of planes. The world is
+    // still a world; only its representation changes, and nothing about it
+    // reaches the viewer -- the wire still carries DISTANCE_SENSOR.
+    bool          splat_world;
 } fixture_def_t;
 
 static const fixture_def_t k_fixtures[FX_COUNT] = {
@@ -180,6 +186,32 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .merged_surface_min = 0.90, .solo_surface_max = 0.45,
     }, 0, 0, 0 },
 
+    // The statue fixtures range against a Gaussian splat of the Statue of
+    // Liberty rather than against planes. Planes cannot answer "does the map
+    // look like the thing it mapped" -- every plane looks like every other
+    // plane -- so the shape thresholds below are what these two exist for.
+    //
+    // Solo: one drone flies a full orbit and climbs, so it can see the whole
+    // statue given time. Its map is expected to resemble the statue outright.
+    [FX_STATUE_SOLO] = { "statue-solo", 120.0, 1, 10.0, SENSOR_OBSTACLE, 1, {
+        .surface_rms_max_m = 1.20, .false_occupied_max = 0.35, .false_free_max = 0.15,
+        .coverage_min = 0.80, .occupied_cells_min = 3000, .occupied_cells_max = -1,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.75,
+        .shape_precision_min = 0.60, .shape_voxel_m = 1.0,
+    }, 0, 0, 2, true },
+
+    // Fleet: four drones, each pinned to its own 90-degree sector and its own
+    // GPS origin. The statue occludes itself, so none of them can see round the
+    // back. The merged map must resemble the statue and no single drone's
+    // contribution may.
+    [FX_STATUE_FLEET] = { "statue-fleet", 60.0, 4, 10.0, SENSOR_OBSTACLE, 1, {
+        .surface_rms_max_m = 1.20, .false_occupied_max = 0.35, .false_free_max = 0.15,
+        .coverage_min = 0.80, .occupied_cells_min = 4000, .occupied_cells_max = -1,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.75,
+        .shape_precision_min = 0.60, .shape_voxel_m = 1.0,
+        .merged_surface_min = 0.90, .solo_surface_max = 0.60,
+    }, 0, 0, 4, true },
+
     [FX_ENDURANCE] = { "endurance", 1920.0, 2, 4.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 0.80, .false_occupied_max = 0.20, .false_free_max = 0.10,
         .coverage_min = 0.90, .occupied_cells_min = 1000, .occupied_cells_max = -1,
@@ -221,6 +253,11 @@ static int orientation_step(double t) { return (int)(t / ORIENT_STEP_S); }
 
 // The mount grid: one plot of ground per mount, spaced far enough apart that a
 // misaimed mount cannot land on a neighbour's plot and be mistaken for it.
+// Statue orbit: far enough out that the 43 m star base stays inside the fan,
+// close enough that a 1.7-degree sector is a 1 m cone at the far side.
+#define STATUE_STANDOFF_M 34.0
+#define STATUE_EYE_M      40.0
+
 #define ORIENT_GRID_COLS 7
 #define ORIENT_PLOT_M    8.0
 
@@ -419,6 +456,50 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             p->yaw = 22.0 * DEG * sin(t * 0.55);
             break;
 
+        // Both statue fixtures fly the fan on its side. Rolling 90 degrees
+        // turns OBSTACLE_DISTANCE's horizontal sweep into a vertical one, so a
+        // single orbit paints the statue top to bottom instead of ringing it at
+        // one altitude. Nothing about the message changes -- the frame is still
+        // BODY_FRD and the viewer resolves it through attitude, which is
+        // precisely the path this exercises.
+        case FX_STATUE_SOLO: {
+            // Four orbits while climbing from below the pedestal to above the
+            // torch. One orbit at one altitude leaves the base and the crown
+            // outside the fan however wide it is -- a 93 m subject needs the
+            // drone to change its elevation angle, not just its bearing.
+            const double u = t / 120.0;
+            const double ang = u * 4.0 * 2.0 * M_PI;
+            p->enu[0] += STATUE_STANDOFF_M * cos(ang);
+            p->enu[1] += STATUE_STANDOFF_M * sin(ang);
+            p->enu[2] = 10.0 + 72.0 * u;
+            p->roll = M_PI * 0.5;
+            p->yaw = ang + M_PI;                        // nose at the statue
+            break;
+        }
+
+        case FX_STATUE_FLEET: {
+            // One drone per quadrant, each confined to its own 90 degrees. The
+            // statue occludes itself, so nothing any of them does gets them
+            // round the back: the partition is enforced by the world and not
+            // only by the flight plan.
+            const double u = t / 60.0;
+            const double centre = (double)veh * (M_PI * 0.5);
+            // Three passes across its own quadrant while climbing, so each
+            // drone covers its sector's full height and none of them leaves it.
+            const double sweep = sin(u * 3.0 * 2.0 * M_PI) * (M_PI * 0.25);
+            const double ang = centre + sweep;
+            p->enu[0] += STATUE_STANDOFF_M * cos(ang);
+            p->enu[1] += STATUE_STANDOFF_M * sin(ang);
+            p->enu[2] = 10.0 + 72.0 * u;
+            p->roll = M_PI * 0.5;
+            p->yaw = ang + M_PI;
+            break;
+        }
+
+        // firehose shares the cooperative orbit: eight vehicles in a bounded
+        // box is exactly the load this fixture wants, and the geometry is
+        // already there. Keep the two labels adjacent -- separating them is how
+        // firehose silently started flying the statue profile.
         case FX_FIREHOSE:
         case FX_COOPERATIVE: {
             // One vehicle per bay, orbiting its own quarter. Nothing here ever
@@ -551,6 +632,8 @@ typedef struct {
     fixture_id_t  fx;
     const fixture_def_t *def;
     geom_scene_t  scene;
+    splat_cloud_t cloud;          // the world, when the fixture uses a splat
+    char          splat_path[384];
     geo_origin_t  session;
     geo_origin_t  vehicle_origin[MAX_SIM_VEHICLES];
     double        vehicle_origin_lla[MAX_SIM_VEHICLES][3];
@@ -686,6 +769,18 @@ static void sensor_axis_enu(const sim_pose_t *p, const sensor_cfg_t *c,
     out[2] = -ned[2];   // up
 }
 
+// One entry point for "what does the world say is at the end of this ray",
+// so a fixture's world model is a property of the fixture and not something
+// every emitter has to know about.
+static bool sim_raycast(const sim_t *s, double t, const double origin[3],
+                        const double dir[3], double max_m, double *t_hit) {
+    if (s->def->splat_world) {
+        if (!s->cloud.count) return false;
+        return splat_raycast(&s->cloud, origin, dir, max_m, t_hit);
+    }
+    return geom_scene_raycast(&s->scene, t, origin, dir, max_m, t_hit, NULL);
+}
+
 static void record_truth_ray(sim_t *s, double t, int veh, const double origin[3],
                              const double dir[3], double range, bool hit) {
     if (!s->have_truth) return;
@@ -727,7 +822,7 @@ static void emit_distance_sensor(sim_t *s, int veh, double t, const sim_pose_t *
     double range = max_m;
     bool hit = false;
     double t_hit;
-    if (geom_scene_raycast(&s->scene, t, p->enu, dir, max_m, &t_hit, NULL)) {
+    if (sim_raycast(s, t, p->enu, dir, max_m, &t_hit)) {
         range = t_hit;
         hit = true;
     }
@@ -787,8 +882,18 @@ static void emit_distance_sensor(sim_t *s, int veh, double t, const sim_pose_t *
 
 static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t *p) {
     const int sectors = OBSTACLE_DISTANCE_SECTORS;
-    const float increment = 360.0f / (float)sectors;
-    const uint16_t min_cm = 20, max_cm = 3000;
+
+    // Most fixtures use the default full-circle fan: 72 sectors of 5 degrees,
+    // the way a 360-degree proximity lidar reports. The statue fixtures declare
+    // a narrow one instead, because the subject is 93 m tall and a 5-degree
+    // sector at 35 m is a 1.5 m cone -- a sensor that cannot resolve a face
+    // cannot be asked to prove the map has one. A 1.7-degree fan is the same
+    // message with a different increment, which is the whole point of
+    // increment_f being a float.
+    const bool statue = s->def->splat_world;
+    const float increment = statue ? 1.7f : (360.0f / (float)sectors);
+    const float angle_offset = statue ? -61.0f : 0.0f;
+    const uint16_t min_cm = 20, max_cm = statue ? 9000 : 3000;
     const double max_m = (double)max_cm * 0.01;
 
     uint16_t distances[OBSTACLE_DISTANCE_SECTORS];
@@ -798,7 +903,7 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
     for (int i = 0; i < sectors; i++) {
         // Sector i is `angle_offset + i * increment` from the vehicle nose,
         // measured in body FRD. Off-by-one here rotates the whole map.
-        const double bearing = (double)i * (double)increment * DEG;
+        const double bearing = ((double)angle_offset + (double)i * (double)increment) * DEG;
         const double body[3] = { cos(bearing), sin(bearing), 0.0 };
         double ned[3];
         ob_quat_rotate(q_nb, body, ned);
@@ -807,7 +912,7 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
         double range = max_m;
         bool hit = false;
         double t_hit;
-        if (geom_scene_raycast(&s->scene, t, p->enu, dir, max_m, &t_hit, NULL)) {
+        if (sim_raycast(s, t, p->enu, dir, max_m, &t_hit)) {
             range = t_hit;
             hit = true;
         }
@@ -818,7 +923,8 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
     mavlink_message_t msg;
     mavlink_msg_obstacle_distance_pack((uint8_t)(veh + 1), 1, &msg,
         (uint64_t)(t * 1e6), MAV_DISTANCE_SENSOR_LASER, distances,
-        (uint8_t)lrint(increment), min_cm, max_cm, increment, 0.0f, MAV_FRAME_BODY_FRD);
+        (uint8_t)lrint(increment), min_cm, max_cm, increment, angle_offset,
+        MAV_FRAME_BODY_FRD);
     emit(&s->em, t, &msg);
 }
 
@@ -919,10 +1025,21 @@ static int run(sim_t *s, uint32_t seed, double scale) {
     h.root_size_m = 1024.0;
     h.max_depth = 12;          // 0.25 m leaves under a 1024 m root
     h.coarse_depth = 9;        // 2 m far-field carving
+    if (s->def->splat_world) {
+        // A 1.7-degree sector at 35 m is a 1 m footprint. Running the map four
+        // times finer than the sensor can resolve does not buy detail -- it
+        // fragments the surface, because each pass places its evidence in a
+        // slightly different quarter-metre cell and the free-space carve from
+        // one viewpoint then debits the hit from another. Half-metre leaves sit
+        // just inside what the beam can actually justify.
+        h.max_depth = 12;      // 0.25 m leaves, as elsewhere
+        h.coarse_depth = 9;
+    }
     h.skip_near_m = 1.0;
     h.queue_capacity = s->def->queue_capacity;
     h.budget_per_drain = s->def->budget_per_drain;
     h.map_byte_cap = (size_t)512 * 1024 * 1024;
+    snprintf(h.splat_path, sizeof(h.splat_path), "%s", s->splat_path);
     h.thresholds = s->def->th;
 
     // The load-dependent thresholds have to follow the load. `firehose` is the
@@ -954,6 +1071,7 @@ static void usage(void) {
     printf("  --realtime         pace UDP emission against the wall clock\n");
     printf("  --seed <n>         RNG seed (default 1)\n");
     printf("  --scale <f>        scale vehicle count and duration (default 1)\n");
+    printf("  --splat <file>     Gaussian splat world (required by the statue fixtures)\n");
     printf("  --list             print fixture names, one per line\n");
 }
 
@@ -964,6 +1082,7 @@ int main(int argc, char **argv) {
     const char *udp_target = NULL;
     uint32_t seed = 1;
     double scale = 1.0;
+    const char *splat_path = NULL;
     bool realtime = false;
 
     for (int i = 1; i < argc; i++) {
@@ -974,6 +1093,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--realtime") == 0) realtime = true;
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = (uint32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--scale") == 0 && i + 1 < argc) scale = atof(argv[++i]);
+        else if (strcmp(argv[i], "--splat") == 0 && i + 1 < argc) splat_path = argv[++i];
         else if (strcmp(argv[i], "--list") == 0) {
             for (int k = 0; k < FX_COUNT; k++) printf("%s\n", k_fixtures[k].name);
             return 0;
@@ -1002,6 +1122,23 @@ int main(int argc, char **argv) {
     }
     if (s.vehicles < 1) s.vehicles = 1;
     if (s.vehicles > MAX_SIM_VEHICLES) s.vehicles = MAX_SIM_VEHICLES;
+
+    if (s.def->splat_world) {
+        if (!splat_path) {
+            fprintf(stderr, "fixture '%s' ranges against a splat world; pass --splat <file>\n",
+                    s.def->name);
+            return 2;
+        }
+        char err[256] = {0};
+        if (splat_load(&s.cloud, splat_path, err, sizeof(err)) != 0) {
+            fprintf(stderr, "splat: %s\n", err);
+            return 2;
+        }
+        snprintf(s.splat_path, sizeof(s.splat_path), "%s", splat_path);
+        printf("splat world: %u gaussians, %.1f x %.1f x %.1f m\n", s.cloud.count,
+               s.cloud.hi[0] - s.cloud.lo[0], s.cloud.hi[1] - s.cloud.lo[1],
+               s.cloud.hi[2] - s.cloud.lo[2]);
+    }
 
     build_scene(fx, &s.scene);
     geo_origin_set(&s.session, SESSION_LAT, SESSION_LON, SESSION_ALT);
