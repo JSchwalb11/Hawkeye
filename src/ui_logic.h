@@ -26,12 +26,18 @@
  *   pin           – false = select (clears pins), true = toggle pin
  *   selected      – pointer to the currently selected vehicle index
  *   vehicle_count – total number of vehicles (limits max pins)
+ *
+ * An idx outside [0, vehicle_count) is ignored. Callers feed this from key
+ * chords, and every per-vehicle array is allocated to exactly vehicle_count,
+ * so an out-of-range index here becomes an out-of-bounds access everywhere.
  */
 static inline void apply_vehicle_selection(int pinned[HUD_MAX_PINNED],
                                            int *pinned_count,
                                            int idx, bool pin,
                                            int *selected, int vehicle_count)
 {
+    if (idx < 0 || idx >= vehicle_count) return;
+
     if (pin) {
         if (idx != *selected) {
             int found = -1;

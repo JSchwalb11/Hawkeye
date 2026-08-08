@@ -7,7 +7,7 @@ Every Hawkeye CLI flag with description and default value.
 | Flag                             | Description                                                   | Default         |
 | -------------------------------- | ------------------------------------------------------------- | --------------- |
 | `-udp <port>`                    | UDP base port for MAVLink telemetry                           | `19410`         |
-| `-n <count>`                     | Number of vehicles (max 16)                                   | `1`             |
+| `-n <count>`                     | Number of vehicles (sanity range 1–255)                       | `1`             |
 | `-mc`                            | Default to multicopter model                                  | on              |
 | `-fw`                            | Default to fixed-wing model                                   | off             |
 | `-ts`                            | Default to tailsitter model                                   | off             |
@@ -28,7 +28,7 @@ In live MAVLink mode, each vehicle binds its own UDP socket at `base_port + N`:
 | Vehicle 2  | 19411                     |
 | Vehicle 3  | 19412                     |
 | ...        | ...                       |
-| Vehicle 16 | 19425                     |
+| Vehicle N  | 19410 + N - 1             |
 
 Change the base port with `-udp`.
 All subsequent vehicle ports increment from there.
@@ -80,7 +80,7 @@ hawkeye --replay flight.ulg
 hawkeye --replay drone1.ulg drone2.ulg drone3.ulg
 ```
 
-Up to 16 files.
+Up to 255 files.
 See [ULog Replay](replay.md) for details.
 
 ### Ghost overlay: compare two flights

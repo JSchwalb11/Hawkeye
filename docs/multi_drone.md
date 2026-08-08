@@ -1,6 +1,7 @@
 # Multi-Drone Replay (Hawkeye)
 
-Hawkeye loads up to 16 ULog files simultaneously and replays them together as a coordinated swarm.
+Hawkeye loads a runtime-sized set of ULog files (up to the 255-vehicle sanity
+limit) and replays them together as a coordinated swarm.
 This page covers the multi-drone-specific features: deconfliction when drones have different launch points, CUSUM-based takeoff alignment, and real-time correlation statistics between pinned drones.
 
 For single-log replay basics and the transport controls, see [ULog Replay](replay.md).
@@ -11,7 +12,7 @@ For single-log replay basics and the transport controls, see [ULog Replay](repla
 hawkeye --replay drone1.ulg drone2.ulg drone3.ulg
 ```
 
-Up to 16 files are supported.
+Up to 255 files are supported.
 Each becomes a replay-backed vehicle in the scene, with its own trail, markers, and telemetry.
 Hawkeye pre-scans every log (as with single-log replay) and additionally checks for conflicts between them.
 
@@ -148,6 +149,12 @@ Correlation analysis provides real-time Pearson correlation and RMSE statistics 
 4. PRSN / RMSE / CONF badges appear in the Console HUD sidebar.
 
 ![Correlation HUD](./assets/sim_hawkeye/correlation-hud.png)
+
+Correlation is accumulated for the 16 drones on the selected drone's selector
+page, not the entire fleet — the statistics are pairwise against the selected
+drone, so scoring 254 partners every frame would cost far more than it tells
+you. Changing the selection resets every drone's PRSN / RMSE and starts the
+accumulators over.
 
 _<!-- 07-img-07: HUD sidebar showing PRSN/RMSE/CONF badges with example values. -->_
 

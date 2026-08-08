@@ -10,6 +10,10 @@
 #define HUD_MAX_PINNED 15
 #define HUD_MARKER_LABEL_MAX 48
 
+// Vehicles per selector page. The numpad grid and the paging logic in main.c
+// must agree on this, so it lives with the hud_t that carries selector_page.
+#define HUD_FLEET_PAGE_SIZE 16
+
 typedef enum {
     HUD_CONSOLE,
     HUD_TACTICAL,
@@ -36,6 +40,7 @@ typedef struct {
     float sim_time_s;
     int pinned[HUD_MAX_PINNED];   // indices of pinned vehicles (-1 = empty)
     int pinned_count;
+    int selector_page;             // zero-based page of HUD_FLEET_PAGE_SIZE vehicle slots
     bool show_help;
     bool is_replay;     // true when data source is ULog replay (affects layout)
     bool show_yaw;      // Y key: swap HDG for YAW display

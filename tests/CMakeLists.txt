@@ -49,6 +49,16 @@ add_executable(test_obj_models test_obj_models.c)
 target_compile_definitions(test_obj_models PRIVATE MODELS_DIR="${CMAKE_SOURCE_DIR}/models")
 add_test(NAME obj_models COMMAND test_obj_models)
 
+if(UNIX AND EXISTS "${MAVLINK_DIR}/common/mavlink.h")
+    add_executable(test_mavlink_receiver test_mavlink_receiver.c
+        ${CMAKE_SOURCE_DIR}/src/mavlink_receiver.c)
+    target_include_directories(test_mavlink_receiver PRIVATE
+        ${CMAKE_SOURCE_DIR}/src ${MAVLINK_DIR} ${MAVLINK_DIR}/common)
+    target_compile_definitions(test_mavlink_receiver PRIVATE MAVLINK_COMM_NUM_BUFFERS=256)
+    target_link_libraries(test_mavlink_receiver PRIVATE m)
+    add_test(NAME mavlink_receiver COMMAND test_mavlink_receiver)
+endif()
+
 # Theme parser + trail LOD tests (need raylib headers for Color/Vector3)
 if(TARGET raylib)
     add_executable(test_theme test_theme.c ${CMAKE_SOURCE_DIR}/src/theme.c)
