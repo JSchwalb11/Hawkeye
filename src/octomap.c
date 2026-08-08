@@ -184,6 +184,24 @@ bool octomap_chunk_next(const octomap_t *m, uint32_t *cursor, int64_t *out_key) 
     return false;
 }
 
+bool octomap_content_bounds(const octomap_t *m, double lo[3], double hi[3]) {
+    if (!m || !m->chunks || !lo || !hi) return false;
+    bool any = false;
+    uint32_t cursor = 0;
+    int64_t key;
+    while (octomap_chunk_next(m, &cursor, &key)) {
+        double c[3], size;
+        octomap_chunk_center(m, key, c, &size);
+        const double h = size * 0.5;
+        for (int k = 0; k < 3; k++) {
+            if (!any || c[k] - h < lo[k]) lo[k] = c[k] - h;
+            if (!any || c[k] + h > hi[k]) hi[k] = c[k] + h;
+        }
+        any = true;
+    }
+    return any;
+}
+
 // ---------------------------------------------------------------- pool
 
 static bool pool_reserve(octomap_t *m, uint32_t needed) {

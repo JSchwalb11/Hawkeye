@@ -216,6 +216,12 @@ void octomap_iterate_chunk_lod(const octomap_t *m, int64_t chunk_key, int max_de
 
 int64_t octomap_chunk_key(const octomap_t *m, double x, double y, double z);
 void    octomap_chunk_center(const octomap_t *m, int64_t key, double out[3], double *out_size);
+
+// Axis-aligned bounds of everything the map holds, to chunk resolution. Reads
+// the chunk index rather than walking the tree, so it is cheap enough to call
+// every frame -- which is what a camera that frames the map needs. Returns
+// false when the map is empty.
+bool    octomap_content_bounds(const octomap_t *m, double lo[3], double hi[3]);
 bool    octomap_chunk_is_dirty(const octomap_t *m, int64_t key);
 void    octomap_chunk_clear_dirty(octomap_t *m, int64_t key);
 void    octomap_chunks_clear_all_dirty(octomap_t *m);

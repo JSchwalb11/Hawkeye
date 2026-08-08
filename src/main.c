@@ -30,6 +30,7 @@
 #include "tactical_hud.h"
 #include "map_session.h"
 #include "map_render.h"
+#include "capture.h"
 #include "map_hud.h"
 #include "quality_overlay.h"
 #include "skynet_manifest.h"
@@ -65,6 +66,10 @@ static void print_usage(const char *prog) {
     printf("  --map-cap <MiB>        Map memory ceiling (default: 256)\n");
     printf("  --map-res <m>          Leaf size in metres (default: 0.25)\n");
     printf("  --map-origin centroid  Use the fleet centroid rather than the first origin\n");
+    printf("  --view <mode>          Start in a fullscreen ortho view: top, bottom,\n");
+    printf("                         front, back, left, right (chase = default)\n");
+    printf("  --view-span <m>        Ortho span in metres (default: fit to the map)\n");
+    printf("  --follow-map           Aim the camera at the map, not the aircraft\n");
 }
 
 /* Thin wrapper: delegates to the testable inline in ui_logic.h */
@@ -236,7 +241,19 @@ int main(int argc, char *argv[]) {
     double map_res_m = 0.25;
     fleet_origin_policy_t map_origin_policy = FLEET_ORIGIN_FIRST_SEEN;
 
+    capture_t capture;
+    capture_defaults(&capture);
+
+    // Framing for an unattended run. Nobody is there to press Alt+2 or drag the
+    // camera onto the map, so the view has to be settable from the command line
+    // for a recording to show anything worth recording.
+    ortho_mode_t start_view = ORTHO_NONE;
+    double view_span_m = 0.0;      // 0 = fit to the map
+    bool   follow_map = false;
+
     for (int i = 1; i < argc; i++) {
+        const int taken = capture_parse_arg(&capture, argc, argv, i);
+        if (taken > 0) { i += taken - 1; continue; }
         if (strcmp(argv[i], "-udp") == 0 && i + 1 < argc) {
             base_port = (uint16_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -306,8 +323,24 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--map-origin") == 0 && i + 1 < argc) {
             map_origin_policy = (strcmp(argv[++i], "centroid") == 0)
                 ? FLEET_ORIGIN_CENTROID : FLEET_ORIGIN_FIRST_SEEN;
+        } else if (strcmp(argv[i], "--view") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if      (strcmp(v, "top") == 0)    start_view = ORTHO_TOP;
+            else if (strcmp(v, "bottom") == 0) start_view = ORTHO_BOTTOM;
+            else if (strcmp(v, "front") == 0)  start_view = ORTHO_FRONT;
+            else if (strcmp(v, "back") == 0)   start_view = ORTHO_BACK;
+            else if (strcmp(v, "left") == 0)   start_view = ORTHO_LEFT;
+            else if (strcmp(v, "right") == 0)  start_view = ORTHO_RIGHT;
+            else if (strcmp(v, "chase") == 0)  start_view = ORTHO_NONE;
+            else { fprintf(stderr, "unknown --view %s\n", v); return 1; }
+            follow_map = true;
+        } else if (strcmp(argv[i], "--view-span") == 0 && i + 1 < argc) {
+            view_span_m = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--follow-map") == 0) {
+            follow_map = true;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
+            capture_usage();
             return 0;
         }
     }
@@ -695,6 +728,15 @@ int main(int argc, char *argv[]) {
     bool show_marker_labels = true;
     marker_input_t marker_input = {0};
     marker_input.target = -1;
+
+    if (start_view != ORTHO_NONE) {
+        scene.ortho_mode = start_view;
+        scene.ortho_span = (view_span_m > 0.0) ? (float)view_span_m : 60.0f;
+    }
+    if (follow_map && !map_ready)
+        fprintf(stderr, "hawkeye: --follow-map has nothing to follow with --no-map\n");
+
+    if (!capture_begin(&capture, "hawkeye")) return 1;
 
     // Main loop
     while (!WindowShouldClose()) {
@@ -1502,6 +1544,40 @@ int main(int argc, char *argv[]) {
             Vector3 cam_target = vehicles[selected].position;
             if (hud.mode == HUD_TACTICAL)
                 cam_target.y += scene.chase_distance * 0.10f;
+
+            // An unattended run frames the map rather than the aircraft. The
+            // two are not the same place: a vehicle whose origin has not
+            // resolved yet is drawn at the world origin while its rays are
+            // already landing wherever the fleet frame says they belong.
+            if (follow_map && map_ready) {
+                double lo[3], hi[3];
+                if (octomap_content_bounds(&map_session.map, lo, hi)) {
+                    const double mid[3] = { (lo[0] + hi[0]) * 0.5,
+                                            (lo[1] + hi[1]) * 0.5,
+                                            (lo[2] + hi[2]) * 0.5 };
+                    float w[3];
+                    fleet_enu_to_world(mid, w);
+                    cam_target = (Vector3){ w[0], w[1], w[2] };
+
+                    if (view_span_m > 0.0) {
+                        scene.ortho_span = (float)view_span_m;
+                    } else {
+                        // Fit, with a margin so the newest cells are not sitting
+                        // on the edge of frame the moment they appear.
+                        double span = hi[0] - lo[0];
+                        if (hi[1] - lo[1] > span) span = hi[1] - lo[1];
+                        if (hi[2] - lo[2] > span) span = hi[2] - lo[2];
+                        span *= 1.25;
+                        if (span < 10.0) span = 10.0;
+                        if (span > 500.0) span = 500.0;
+                        // Ease rather than snap: the map grows chunk by chunk and
+                        // a camera that jumps on every new one is unwatchable.
+                        scene.ortho_span += ((float)span - scene.ortho_span) * 0.08f;
+                    }
+                    scene.ortho_pan = (Vector3){ 0, 0, 0 };
+                    scene.chase_distance = scene.ortho_span * 0.9f;
+                }
+            }
             scene_update_camera(&scene, cam_target, vehicles[selected].rotation);
         }
 
@@ -1815,7 +1891,13 @@ int main(int argc, char *argv[]) {
             }
 
         EndDrawing();
+
+        // After the present, so what is recorded is exactly the frame that was
+        // shown -- there is no second offscreen path that could drift from it.
+        if (capture_tick(&capture)) break;
     }
+
+    capture_finish(&capture);
 
     // Cleanup
     if (map_render_ready) map_render_free(&map_render);

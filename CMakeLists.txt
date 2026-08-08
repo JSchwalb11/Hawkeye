@@ -86,6 +86,8 @@ if(NOT BUILD_TESTING_ONLY)
         src/map_render.c
         src/map_hud.c
         src/quality_overlay.c
+        src/capture.c
+        src/gif.c
     )
 
     target_include_directories(hawkeye PRIVATE
