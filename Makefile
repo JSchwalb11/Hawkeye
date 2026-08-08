@@ -53,6 +53,20 @@ renders: fixtures
 			--tlog $(BUILD_DIR)/test/fixture-runs/$$f.tlog \
 			--render docs/assets/fleet-map/$$f.png >/dev/null; \
 	done
+	@for f in statue-solo statue-fleet; do \
+		$(BUILD_DIR)/test/ray_injector --fixture $$f \
+			--splat assets/statue_of_liberty.splat \
+			--mesh assets/statue_of_liberty.tri \
+			--tlog $(BUILD_DIR)/test/fixture-runs/$$f.tlog \
+			--truth $(BUILD_DIR)/test/fixture-runs/$$f.truth >/dev/null; \
+		$(BUILD_DIR)/test/map_checker \
+			--truth $(BUILD_DIR)/test/fixture-runs/$$f.truth \
+			--tlog $(BUILD_DIR)/test/fixture-runs/$$f.tlog \
+			--render docs/assets/fleet-map/$$f.png \
+			--gif docs/assets/fleet-map/$$f-mapping.gif \
+			--gif-interval 1.0 --gif-size 440 620 \
+			--gif-view side --gif-delay 9 >/dev/null; \
+	done
 	@echo "renders written to docs/assets/fleet-map/"
 
 # Address + undefined behavior sanitizers

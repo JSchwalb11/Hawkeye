@@ -30,7 +30,9 @@ if(WIN32)
     target_link_libraries(ray_injector PRIVATE ws2_32)
 endif()
 
-add_executable(map_checker map_checker.c)
+# gif.c is plain C with no raylib in it, so the checker can write a GIF of the
+# map filling in without a window or a GPU.
+add_executable(map_checker map_checker.c ${CMAKE_SOURCE_DIR}/src/gif.c)
 target_link_libraries(map_checker PRIVATE hawkeye-fixture-support hawkeye-core)
 target_include_directories(map_checker PRIVATE
     ${CMAKE_SOURCE_DIR}/src ${MAVLINK_DIR} ${MAVLINK_DIR}/common)

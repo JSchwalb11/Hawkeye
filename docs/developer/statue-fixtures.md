@@ -103,22 +103,35 @@ claim on a real object rather than on a box.
 
 ## Watching it happen
 
-`statue-fleet` replayed through the viewer, front orthographic, free space
-hidden, captured headless under Xvfb:
+Four drones, one bay of sky each, sixty seconds — the statue emerging from
+nothing but `OBSTACLE_DISTANCE` messages:
 
-![statue-fleet-build](../assets/fleet-map/statue-fleet-build.gif)
+![statue-fleet mapping](../assets/fleet-map/statue-fleet-mapping.gif)
+
+Rendered straight from the octree at one-second intervals during replay, so it
+needs no GPU and no window and is reproducible in CI. `make renders` writes it,
+or by hand:
 
 ```
-xvfb-run -s "-screen 0 1000x680x24" hawkeye \
-    --tlog statue-fleet.tlog --view front --view-span 110 \
-    --map-hide-free --capture-gif build.gif --capture-fps 1.6 --exit-after 60
+map_checker --tlog statue-fleet.tlog --truth statue-fleet.truth \
+    --gif statue-fleet-mapping.gif --gif-interval 1.0 \
+    --gif-size 440 620 --gif-view side
 ```
 
-The viewer's instanced 3D view is sparser than the checker's orthographic
-projection of the same map: it draws cubes at LOD with a per-frame extraction
-budget of 24 chunks and frustum culling, so on a map this size it is still
-working through its backlog while the log plays. The map itself is complete —
-`RAYS DROPPED` reads 0 and the checker scores it as above.
+The framing comes from the truth rays' *hit* endpoints, computed before the
+first frame. Fitting to the map instead would frame whatever the first second
+of flight happened to see and then let the subject grow off the edge; including
+no-return endpoints would frame the sensor's reach rather than the thing it was
+looking at.
+
+The same run through the actual viewer, captured headless under Xvfb, is in
+[`corridor-replay.gif`](../assets/fleet-map/corridor-replay.gif) for the
+corridor fixture. On a map the size of the statue the viewer's instanced 3D
+view is sparser than the projection above — it draws cubes at LOD with a
+24-chunk-per-frame extraction budget and frustum culling, so it is still
+working through its backlog while the log plays. The map itself is complete:
+`RAYS DROPPED` reads 0 and the checker scores it as tabled above. Worth a
+follow-up, and not something to paper over with a prettier recording.
 
 ## Centimetres: `statue-precision`
 

@@ -30,6 +30,7 @@
 #include "canvas.h"
 #include "splat.h"
 #include "trimesh.h"
+#include "gif.h"
 #include "ortho_render.h"
 #include "tlog.h"
 #include "truth.h"
@@ -244,8 +245,72 @@ static uint64_t count_drop_events(const timeline_t *tl) {
     return n;
 }
 
+// A GIF of the map filling in, rendered straight from the octree at intervals
+// during replay. The viewer can record itself now, but its instanced 3D view
+// is a different question from "what does the map contain" -- this draws the
+// contents, on any machine, with no GPU and no window, and is reproducible in
+// CI.
+typedef struct {
+    gif_writer_t *gif;
+    canvas_t      canvas;
+    double        interval_s;
+    double        next_s;
+    ortho_view_t  view;
+    double        bounds_min[3], bounds_max[3];
+    bool          have_bounds;
+    int           frames;
+} progress_gif_t;
+
+static void progress_frame(progress_gif_t *g, const octomap_t *map,
+                           const truth_t *t, double t_s) {
+    if (!g->gif) return;
+
+    // Framing comes from the truth rays, computed once before the first frame.
+    // Fitting to the map instead would frame whatever the first second of
+    // flight happened to see and then let the subject grow off the edge; the
+    // rays say up front where the whole run will look.
+    if (!g->have_bounds) {
+        bool any = false;
+        for (uint32_t i = 0; i < t->ray_count; i++) {
+            // Hits only. A no-return ends at max range, so including those
+            // frames the sensor's reach rather than the thing it was looking
+            // at, and the subject ends up a smudge in the middle.
+            if (!t->rays[i].hit) continue;
+            const float *e = t->rays[i].endpoint;
+            for (int k = 0; k < 3; k++) {
+                if (!any) { g->bounds_min[k] = e[k]; g->bounds_max[k] = e[k]; }
+                else {
+                    if (e[k] < g->bounds_min[k]) g->bounds_min[k] = e[k];
+                    if (e[k] > g->bounds_max[k]) g->bounds_max[k] = e[k];
+                }
+            }
+            any = true;
+        }
+        if (!any) ortho_auto_bounds(map, 4.0, g->bounds_min, g->bounds_max);
+        else for (int k = 0; k < 3; k++) { g->bounds_min[k] -= 3.0; g->bounds_max[k] += 3.0; }
+        g->have_bounds = true;
+    }
+
+    canvas_fill_rect(&g->canvas, 0, 0, g->canvas.w, g->canvas.h, 0x0d1117, 1.0f);
+
+    ortho_opts_t o;
+    memset(&o, 0, sizeof(o));
+    memcpy(o.min, g->bounds_min, sizeof(o.min));
+    memcpy(o.max, g->bounds_max, sizeof(o.max));
+    o.truth_time_s = t_s;
+
+    char sub[96];
+    snprintf(sub, sizeof(sub), "T %+.1f S   %s", t_s, t->header.fixture);
+    o.subtitle = sub;
+
+    ortho_draw_panel(&g->canvas, 0, 0, g->canvas.w, g->canvas.h,
+                     map, g->view, ORTHO_OCCUPANCY, &o, "OCCUPANCY");
+    gif_add_frame(g->gif, g->canvas.px);
+    g->frames++;
+}
+
 static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *t,
-                       report_t *rep) {
+                       report_t *rep, progress_gif_t *pg) {
     tlog_reader_t r;
     if (tlog_reader_open(&r, tlog_path, 0) != 0) {
         fprintf(stderr, "cannot open tlog %s\n", tlog_path);
@@ -271,6 +336,16 @@ static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *
         while (arrival >= next_drain) {
             map_ingest_drain(&ms->ingest, &ms->map, 1.0f / 60.0f);
             next_drain += FRAME_NS;
+        }
+        if (pg && pg->gif) {
+            const double t_s = (double)(arrival - first_ns) * 1e-9;
+            if (t_s >= pg->next_s) {
+                // Drain first, so a frame shows the map as of this instant
+                // rather than the map minus whatever is still queued.
+                map_ingest_drain_all(&ms->ingest, &ms->map);
+                progress_frame(pg, &ms->map, t, t_s);
+                pg->next_s += pg->interval_s;
+            }
         }
         if (!half_sampled && arrival >= half_ns) {
             // Sampled mid-run so `endurance` can show memory plateauing rather
@@ -298,11 +373,103 @@ static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *
     return 0;
 }
 
+// --- Sparse voxel set -------------------------------------------------
+//
+// Open-addressed, keyed by the voxel's integer coordinate. Holds only voxels
+// something touched, which is the whole point: the dense alternative is
+// indexed by the bounding box and asks for hundreds of gigabytes the moment
+// the lattice gets fine.
+
+#define LAT_WORLD    0x01
+#define LAT_OBSERVED 0x02
+#define LAT_MAP      0x04
+#define LAT_NEAR     0x08
+
+#define VOX_EMPTY    INT64_MIN
+// Floor division, so a voxel index is continuous across zero. Truncation would
+// fold -0.5 and +0.5 into the same cell and put a seam through the origin.
+#define VOX_FLOOR(x) ((int)floor(x))
+// Each axis gets 21 bits, biased to be non-negative: +/-1048575 voxels, which
+// at the finest lattice used here is a world 8 km across.
+#define VOX_LIMIT    1048575
+
 typedef struct {
-    uint8_t     *lat;
-    const double *blo;
-    const int   *dim;
-    double       vox;
+    int64_t *key;
+    uint8_t *val;
+    uint32_t cap;      // power of two
+    uint32_t count;
+} vox_set_t;
+
+static inline int64_t vox_key(int ix, int iy, int iz) {
+    return ((int64_t)(ix + VOX_LIMIT + 1) << 42)
+         | ((int64_t)(iy + VOX_LIMIT + 1) << 21)
+         |  (int64_t)(iz + VOX_LIMIT + 1);
+}
+
+static inline uint64_t vox_hash(int64_t k) {
+    uint64_t x = (uint64_t)k;
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static bool vox_init(vox_set_t *s, size_t expect) {
+    uint32_t cap = 1024;
+    while ((size_t)cap < expect * 2 && cap < (1u << 30)) cap <<= 1;
+    s->key = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
+    s->val = (uint8_t *)calloc(cap, 1);
+    if (!s->key || !s->val) { free(s->key); free(s->val); memset(s, 0, sizeof(*s)); return false; }
+    for (uint32_t i = 0; i < cap; i++) s->key[i] = VOX_EMPTY;
+    s->cap = cap;
+    s->count = 0;
+    return true;
+}
+
+static void vox_free(vox_set_t *s) {
+    if (!s) return;
+    free(s->key); free(s->val);
+    memset(s, 0, sizeof(*s));
+}
+
+static bool vox_grow(vox_set_t *s) {
+    vox_set_t n;
+    if (!vox_init(&n, (size_t)s->cap)) return false;
+    for (uint32_t i = 0; i < s->cap; i++) {
+        if (s->key[i] == VOX_EMPTY) continue;
+        uint32_t h = (uint32_t)(vox_hash(s->key[i]) & (n.cap - 1));
+        while (n.key[h] != VOX_EMPTY) h = (h + 1) & (n.cap - 1);
+        n.key[h] = s->key[i];
+        n.val[h] = s->val[i];
+        n.count++;
+    }
+    vox_free(s);
+    *s = n;
+    return true;
+}
+
+static void vox_mark(vox_set_t *s, int ix, int iy, int iz, uint8_t flags) {
+    if (ix < -VOX_LIMIT || ix > VOX_LIMIT ||
+        iy < -VOX_LIMIT || iy > VOX_LIMIT ||
+        iz < -VOX_LIMIT || iz > VOX_LIMIT) return;
+    if ((size_t)(s->count + 1) * 4 >= (size_t)s->cap * 3 && !vox_grow(s)) return;
+    const int64_t k = vox_key(ix, iy, iz);
+    uint32_t h = (uint32_t)(vox_hash(k) & (s->cap - 1));
+    for (;;) {
+        if (s->key[h] == VOX_EMPTY) {
+            s->key[h] = k;
+            s->val[h] = flags;
+            s->count++;
+            return;
+        }
+        if (s->key[h] == k) { s->val[h] |= flags; return; }
+        h = (h + 1) & (s->cap - 1);
+    }
+}
+
+typedef struct {
+    vox_set_t *vs;
+    double     inv;    // 1 / voxel size
 } shape_mark_t;
 
 static void mark_map_leaf(const om_leaf_t *leaf, void *user) {
@@ -311,16 +478,13 @@ static void mark_map_leaf(const om_leaf_t *leaf, void *user) {
     const double h = leaf->size * 0.5;
     int lo_i[3], hi_i[3];
     for (int k = 0; k < 3; k++) {
-        lo_i[k] = (int)((leaf->center[k] - h - m->blo[k]) / m->vox);
-        hi_i[k] = (int)((leaf->center[k] + h - m->blo[k]) / m->vox);
-        if (hi_i[k] < 0 || lo_i[k] >= m->dim[k]) return;
-        if (lo_i[k] < 0) lo_i[k] = 0;
-        if (hi_i[k] >= m->dim[k]) hi_i[k] = m->dim[k] - 1;
+        lo_i[k] = VOX_FLOOR((leaf->center[k] - h) * m->inv);
+        hi_i[k] = VOX_FLOOR((leaf->center[k] + h) * m->inv);
     }
     for (int iz = lo_i[2]; iz <= hi_i[2]; iz++)
     for (int iy = lo_i[1]; iy <= hi_i[1]; iy++)
     for (int ix = lo_i[0]; ix <= hi_i[0]; ix++)
-        m->lat[((size_t)iz * m->dim[1] + iy) * m->dim[0] + ix] |= 0x04;   // LAT_MAP
+        vox_mark(m->vs, ix, iy, iz, LAT_MAP);
 }
 
 static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
@@ -472,49 +636,47 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
         const double vox = t->header.thresholds.shape_voxel_m > 0.0
             ? t->header.thresholds.shape_voxel_m
             : octomap_cell_size(&ms->map, ms->map.max_depth);
-        const double margin = 6.0;
-        double blo[3], bhi[3];
-        int dim[3];
-        size_t cells = 1;
-        for (int k = 0; k < 3; k++) {
-            blo[k] = world.cloud->lo[k] - margin;
-            bhi[k] = world.cloud->hi[k] + margin;
-            dim[k] = (int)((bhi[k] - blo[k]) / vox) + 1;
-            cells *= (size_t)dim[k];
-        }
 
-        uint8_t *lat = (uint8_t *)calloc(cells, 1);
-        if (lat) {
-            #define LAT_WORLD    0x01
-            #define LAT_OBSERVED 0x02
-            #define LAT_MAP      0x04
-            #define LAT_NEAR     0x08
-
-            // Everything below is driven by iteration over the things that
-            // exist -- splats, rays, occupied leaves -- rather than by
-            // sampling the lattice. Sampling costs cells x sub^3 queries,
-            // which at a 5 cm lattice over a 57 m box is 22 billion of them;
-            // iteration costs one pass over each set.
+        // A *sparse* lattice. A dense one is indexed by the bounding box, so a
+        // 7.8 mm voxel over a 57 m world asks for 3.9e11 cells -- and calloc of
+        // a few hundred gigabytes succeeds under Linux overcommit, so the walk
+        // then touches pages until something dies rather than failing fast.
+        // Even the 5 cm case allocated 2.8 GB and spent seventeen seconds
+        // walking cells that could not possibly hold anything.
+        //
+        // Nothing about the metric needs the empty space. Every set involved --
+        // splats, ray endpoints, occupied leaves -- is enumerable, so the
+        // lattice only ever has to hold voxels something actually touched.
+        // Memory and time now scale with content, and the fine case is exact
+        // instead of coarsened to fit.
+        vox_set_t vs;
+        const size_t expect = (size_t)world.cloud->count + t->ray_count
+                            + rep->occupied_cells * 4 + 1024;
+        if (vox_init(&vs, expect)) {
+            const double inv = 1.0 / vox;
 
             // Which voxels an injector ray actually terminated in.
             for (uint32_t i = 0; i < t->ray_count; i++) {
                 if (!t->rays[i].hit) continue;
-                int c[3]; bool ok = true;
-                for (int k = 0; k < 3; k++) {
-                    c[k] = (int)((t->rays[i].endpoint[k] - blo[k]) / vox);
-                    if (c[k] < 0 || c[k] >= dim[k]) ok = false;
-                }
-                if (ok) lat[((size_t)c[2] * dim[1] + c[1]) * dim[0] + c[0]] |= LAT_OBSERVED;
+                vox_mark(&vs, VOX_FLOOR(t->rays[i].endpoint[0] * inv),
+                              VOX_FLOOR(t->rays[i].endpoint[1] * inv),
+                              VOX_FLOOR(t->rays[i].endpoint[2] * inv), LAT_OBSERVED);
             }
 
-            // Where the world puts surface.
+            // Where the world puts surface, and a one-voxel dilation of it.
+            // The dilation is precision's tolerance: the sensor's own footprint
+            // is about a metre at this standoff, so a cell one voxel off the
+            // surface is beam width showing rather than an invention -- the
+            // same allowance SURFACE_SLACK_M makes when scoring against planes.
             for (uint32_t i = 0; i < world.cloud->count; i++) {
-                int c[3]; bool ok = true;
-                for (int k = 0; k < 3; k++) {
-                    c[k] = (int)(((double)world.cloud->s[i].pos[k] - blo[k]) / vox);
-                    if (c[k] < 0 || c[k] >= dim[k]) ok = false;
-                }
-                if (ok) lat[((size_t)c[2] * dim[1] + c[1]) * dim[0] + c[0]] |= LAT_WORLD;
+                const int ix = VOX_FLOOR((double)world.cloud->s[i].pos[0] * inv);
+                const int iy = VOX_FLOOR((double)world.cloud->s[i].pos[1] * inv);
+                const int iz = VOX_FLOOR((double)world.cloud->s[i].pos[2] * inv);
+                vox_mark(&vs, ix, iy, iz, LAT_WORLD);
+                for (int dz = -1; dz <= 1; dz++)
+                for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++)
+                    vox_mark(&vs, ix + dx, iy + dy, iz + dz, LAT_NEAR);
             }
 
             // Where the map does. An occupied cell marks every voxel it
@@ -522,42 +684,25 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
             // and one finer is not lost -- the asymmetry a centre-only test
             // introduces is exactly what made a thin shell vanish.
             {
-                shape_mark_t mk = { lat, blo, dim, vox };
+                shape_mark_t mk = { &vs, inv };
                 octomap_iterate(&ms->map, mark_map_leaf, &mk);
-            }
-
-            // A one-voxel dilation of the world, used only as precision's
-            // target. The sensor's own footprint is about a metre at this
-            // standoff, so a cell placed one voxel off the surface is the beam
-            // width showing, not an invention -- the same allowance
-            // SURFACE_SLACK_M makes when scoring against planes.
-            for (int iz = 0; iz < dim[2]; iz++)
-            for (int iy = 0; iy < dim[1]; iy++)
-            for (int ix = 0; ix < dim[0]; ix++) {
-                const size_t g = ((size_t)iz * dim[1] + iy) * dim[0] + ix;
-                if (!(lat[g] & LAT_WORLD)) continue;
-                for (int dz = -1; dz <= 1; dz++)
-                for (int dy = -1; dy <= 1; dy++)
-                for (int dx = -1; dx <= 1; dx++) {
-                    const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
-                    if (jx < 0 || jy < 0 || jz < 0 ||
-                        jx >= dim[0] || jy >= dim[1] || jz >= dim[2]) continue;
-                    lat[((size_t)jz * dim[1] + jy) * dim[0] + jx] |= LAT_NEAR;
-                }
             }
 
             uint64_t obs_total = 0, obs_hit = 0;
             uint64_t map_total = 0, map_near = 0;
             uint64_t world_total = 0, world_hit = 0, strict_union = 0;
-            for (size_t g = 0; g < cells; g++) {
-                const bool w = (lat[g] & LAT_WORLD) != 0;
-                const bool obs = w && (lat[g] & LAT_OBSERVED);
-                const bool mapd = (lat[g] & LAT_MAP) != 0;
+            for (uint32_t i = 0; i < vs.cap; i++) {
+                if (vs.key[i] == VOX_EMPTY) continue;
+                const uint8_t f = vs.val[i];
+                const bool w = (f & LAT_WORLD) != 0;
+                const bool obs = w && (f & LAT_OBSERVED);
+                const bool mapd = (f & LAT_MAP) != 0;
                 if (obs) { obs_total++; if (mapd) obs_hit++; }
-                if (mapd) { map_total++; if (lat[g] & LAT_NEAR) map_near++; }
+                if (mapd) { map_total++; if (f & LAT_NEAR) map_near++; }
                 if (w) { world_total++; if (mapd) world_hit++; }
                 if (w || mapd) strict_union++;
             }
+
             rep->shape_voxel_m = vox;
             rep->shape_shared_voxels = obs_hit;
             rep->shape_world_voxels = obs_total;
@@ -578,10 +723,9 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
             rep->shape_iou = strict_union ? (double)world_hit / (double)strict_union : 0.0;
             rep->cloud_voxels = world_total;
             rep->cloud_recall = world_total ? (double)world_hit / (double)world_total : 0.0;
-            free(lat);
+            vox_free(&vs);
         }
     }
-
     rep->surface_samples = surface_total;
     if (surface_total) {
         rep->merged_surface = (double)merged_hit / (double)surface_total;
@@ -1017,6 +1161,8 @@ static int render_sheet(const map_session_t *ms, const truth_t *t, const report_
 static void usage(void) {
     printf("map_checker --truth <prefix> [--tlog <path>] [--render <out.png>] [--focus <n>]\n");
     printf("            [--listen <port> [--spawn <injector> --fixture <name>] --seconds <s>]\n");
+    printf("            [--gif <out.gif> [--gif-interval <s>] [--gif-size <w> <h>]\n");
+    printf("             [--gif-view top|side|front] [--gif-delay <centiseconds>]]\n");
 }
 
 int main(int argc, char **argv) {
@@ -1028,6 +1174,10 @@ int main(int argc, char **argv) {
     int listen_port = 0;
     int focus = 0;
     double seconds = 30.0;
+    const char *gif_path = NULL;
+    double gif_interval = 1.0;
+    int gif_w = 560, gif_h = 720, gif_frame_cs = 12;
+    ortho_view_t gif_view = ORTHO_SIDE;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--truth") == 0 && i + 1 < argc) truth_prefix = argv[++i];
@@ -1038,6 +1188,18 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) seconds = atof(argv[++i]);
         else if (strcmp(argv[i], "--render") == 0 && i + 1 < argc) render_path = argv[++i];
         else if (strcmp(argv[i], "--focus") == 0 && i + 1 < argc) focus = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gif") == 0 && i + 1 < argc) gif_path = argv[++i];
+        else if (strcmp(argv[i], "--gif-interval") == 0 && i + 1 < argc) gif_interval = atof(argv[++i]);
+        else if (strcmp(argv[i], "--gif-size") == 0 && i + 2 < argc) {
+            gif_w = atoi(argv[++i]); gif_h = atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--gif-delay") == 0 && i + 1 < argc) gif_frame_cs = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--gif-view") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if (strcmp(v, "top") == 0) gif_view = ORTHO_TOP;
+            else if (strcmp(v, "front") == 0) gif_view = ORTHO_FRONT;
+            else gif_view = ORTHO_SIDE;
+        }
         else { usage(); return 2; }
     }
     if (!truth_prefix || (!tlog_path && !listen_port)) { usage(); return 2; }
@@ -1092,13 +1254,40 @@ int main(int argc, char **argv) {
 
     report_t rep;
     memset(&rep, 0, sizeof(rep));
-    if (replay_tlog(&ms, tlog_path, &truth, &rep) != 0) {
+    progress_gif_t pg;
+    memset(&pg, 0, sizeof(pg));
+    if (gif_path) {
+        pg.interval_s = gif_interval > 0.0 ? gif_interval : 1.0;
+        pg.view = gif_view;
+        if (canvas_init(&pg.canvas, gif_w, gif_h, 0x0d1117) != 0) {
+            fprintf(stderr, "cannot allocate the %dx%d gif canvas\n", gif_w, gif_h);
+            return 1;
+        }
+        int delay_cs = (int)(gif_frame_cs > 0 ? gif_frame_cs : 12);
+        pg.gif = gif_open(gif_path, gif_w, gif_h, delay_cs, true);
+        if (!pg.gif) {
+            fprintf(stderr, "cannot write %s\n", gif_path);
+            return 1;
+        }
+    }
+
+    if (replay_tlog(&ms, tlog_path, &truth, &rep, &pg) != 0) {
         map_session_free(&ms);
         splat_free(&cloud);
         trimesh_free(&mesh);
         truth_free(&truth);
         return 1;
     }
+    if (pg.gif) {
+        // A few frames of the finished map, so the loop does not snap back to
+        // an empty octree the instant it completes.
+        for (int i = 0; i < 8; i++) progress_frame(&pg, &ms.map, &truth, truth.header.duration_s);
+        const uint32_t n = gif_frame_count(pg.gif);
+        gif_close(pg.gif);
+        canvas_free(&pg.canvas);
+        printf("  wrote %s (%u frames)\n", gif_path, n);
+    }
+
     measure(&ms, &truth, &world, &rep);
     print_report(&truth, &rep);
 
