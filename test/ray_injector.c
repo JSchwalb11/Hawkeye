@@ -56,7 +56,7 @@
 typedef enum {
     FX_EMPTY = 0, FX_GROUND, FX_WALL, FX_CORRIDOR, FX_ORIENTATIONS, FX_MOVING,
     FX_TWO_ORIGINS, FX_DISAGREEMENT, FX_VANISHING, FX_CONE, FX_WEAK,
-    FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_COUNT
+    FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_COOPERATIVE, FX_COUNT
 } fixture_id_t;
 
 typedef enum { SENSOR_DISTANCE, SENSOR_OBSTACLE } sensor_kind_t;
@@ -166,6 +166,20 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .min_rays_per_s = 10000.0, .require_drops = 1,
     }, 4096, 150, 8 },
 
+    // The cooperative claim, made falsifiable. Four bays separated by a solid
+    // cross wall, one vehicle confined to each. Occlusion is real -- a vehicle
+    // in the north-east bay firing south hits the cross wall, not the far
+    // outer wall -- so no drone can see more than its own quarter no matter how
+    // long it flies. The merged map must hold the whole structure, and no
+    // single drone's contribution may. Both halves are asserted: a floor on the
+    // union and a ceiling on the best individual. Together they say the fleet
+    // built something none of its members could.
+    [FX_COOPERATIVE] = { "cooperative", 45.0, 4, 10.0, SENSOR_OBSTACLE, 1, {
+        .surface_rms_max_m = 0.80, .false_occupied_max = 0.30, .false_free_max = 0.10,
+        .coverage_min = 0.85, .occupied_cells_min = 800, .occupied_cells_max = -1,
+        .merged_surface_min = 0.90, .solo_surface_max = 0.45,
+    }, 0, 0, 0 },
+
     [FX_ENDURANCE] = { "endurance", 1920.0, 2, 4.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 0.80, .false_occupied_max = 0.20, .false_free_max = 0.10,
         .coverage_min = 0.90, .occupied_cells_min = 1000, .occupied_cells_max = -1,
@@ -270,6 +284,19 @@ static void build_scene(fixture_id_t fx, geom_scene_t *s) {
             break;
 
         case FX_FIREHOSE:
+        case FX_COOPERATIVE:
+            // A 48 x 48 m room divided into four bays by a solid cross wall.
+            // The cross is what makes the fixture mean anything: without it any
+            // one vehicle could eventually see every wall and the union would
+            // prove nothing.
+            add_plane(s, -24, 0, 5, 1, 0, 0, 24, 5, "west");
+            add_plane(s,  24, 0, 5, -1, 0, 0, 24, 5, "east");
+            add_plane(s, 0, -24, 5, 0, 1, 0, 24, 5, "south");
+            add_plane(s, 0,  24, 5, 0, -1, 0, 24, 5, "north");
+            add_plane(s, 0, 0, 5, 1, 0, 0, 24, 5, "divider-ns");
+            add_plane(s, 0, 0, 5, 0, 1, 0, 24, 5, "divider-ew");
+            break;
+
         case FX_ENDURANCE:
             // A bounded box: the endurance fixture needs the volume closed so
             // memory has something to plateau at.
@@ -393,6 +420,20 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             break;
 
         case FX_FIREHOSE:
+        case FX_COOPERATIVE: {
+            // One vehicle per bay, orbiting its own quarter. Nothing here ever
+            // crosses into a neighbour's bay, so the partition is a property of
+            // the flight as well as of the geometry.
+            const double cx = (veh & 1) ? 12.0 : -12.0;
+            const double cy = (veh & 2) ? 12.0 : -12.0;
+            const double phase = t * 0.35 + (double)veh * 0.7;
+            p->enu[0] += cx + 7.0 * cos(phase);
+            p->enu[1] += cy + 7.0 * sin(phase);
+            p->enu[2] = 5.0 + 0.4 * sin(t * 0.5);
+            p->yaw = phase;
+            break;
+        }
+
         case FX_ENDURANCE: {
             const double phase = t * 0.05 + (double)veh * (2.0 * M_PI / 8.0);
             p->enu[0] = 10.0 * cos(phase);

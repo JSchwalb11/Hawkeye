@@ -166,6 +166,14 @@ typedef struct {
     double   group_worst_false_free;
     int      group_worst_id;
     int      group_scored;
+    // Cooperative coverage. `merged` is the share of observed surface the
+    // fleet's map holds; `solo[v]` is the share vehicle v's own observations
+    // account for, read off the per-cell observer bitmask.
+    double   merged_surface;
+    double   solo_surface[TRUTH_MAX_VEHICLES];
+    double   solo_surface_best;
+    int      solo_surface_best_id;
+    uint64_t surface_samples;
 } report_t;
 
 static void configure_session(map_session_t *ms, const truth_t *t) {
@@ -294,6 +302,9 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
     // called free -- a mount aimed at the wrong patch of sky leaves its true
     // endpoint UNKNOWN, and that has to score as a miss or the check is blind
     // to exactly the failure it exists for.
+    uint64_t surface_total = 0, merged_hit = 0;
+    uint64_t solo_hit[TRUTH_MAX_VEHICLES];
+    memset(solo_hit, 0, sizeof(solo_hit));
     static uint32_t grp_total[256], grp_occ[256];
     memset(grp_total, 0, sizeof(grp_total));
     memset(grp_occ, 0, sizeof(grp_occ));
@@ -317,19 +328,38 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
                 // lands on is quantisation at the map's own resolution, not
                 // erosion; losing the surface entirely is what this measures.
                 bool represented = false, any_free = false;
-                for (int a = -1; a <= 1 && !represented; a++)
-                for (int b = -1; b <= 1 && !represented; b++)
-                for (int c = -1; c <= 1 && !represented; c++) {
+                uint32_t observers = 0;
+                for (int a = -1; a <= 1; a++)
+                for (int b = -1; b <= 1; b++)
+                for (int c = -1; c <= 1; c++) {
                     const double p[3] = { end[0] + a * leaf,
                                           end[1] + b * leaf,
                                           end[2] + c * leaf };
-                    const om_state_t st = octomap_query(&ms->map, p[0], p[1], p[2]);
-                    if (st == OM_OCCUPIED) represented = true;
-                    else if (st == OM_FREE) any_free = true;
+                    int d = 0; double cc[3]; double cs = 0.0;
+                    const om_node_t *n = octomap_lookup(&ms->map, p[0], p[1], p[2],
+                                                        &d, cc, &cs);
+                    if (!n) continue;
+                    const om_state_t st = om_node_state(&ms->map, n);
+                    if (st == OM_OCCUPIED) {
+                        represented = true;
+                        // Union, not first-hit: a surface sample counts for
+                        // every drone whose evidence put a cell there. That is
+                        // exactly the correlation the cooperative claim needs --
+                        // it ties a point on the *true* surface back to which
+                        // members of the fleet actually observed it.
+                        observers |= n->observers;
+                    } else if (st == OM_FREE) {
+                        any_free = true;
+                    }
                 }
                 grp_total[ray->group]++;
                 if (represented) { surf_occ++; grp_occ[ray->group]++; }
                 else if (any_free) surf_free++;
+
+                surface_total++;
+                if (represented) merged_hit++;
+                for (int v = 0; v < t->header.vehicle_count && v < TRUTH_MAX_VEHICLES; v++)
+                    if (observers & om_vehicle_bit((uint8_t)v)) solo_hit[v]++;
             }
         }
 
@@ -343,6 +373,20 @@ static void measure(map_session_t *ms, const truth_t *t, report_t *rep) {
     rep->false_free_rate = (surf_free + surf_occ)
         ? (double)surf_free / (double)(surf_free + surf_occ) : 0.0;
     rep->coverage = swept ? (double)observed / (double)swept : 0.0;
+
+    rep->surface_samples = surface_total;
+    if (surface_total) {
+        rep->merged_surface = (double)merged_hit / (double)surface_total;
+        rep->solo_surface_best_id = -1;
+        for (int v = 0; v < t->header.vehicle_count && v < TRUTH_MAX_VEHICLES; v++) {
+            rep->solo_surface[v] = (double)solo_hit[v] / (double)surface_total;
+            if (rep->solo_surface_best_id < 0 ||
+                rep->solo_surface[v] > rep->solo_surface_best) {
+                rep->solo_surface_best = rep->solo_surface[v];
+                rep->solo_surface_best_id = v;
+            }
+        }
+    }
 
     {
         const int min_rays = t->header.thresholds.group_min_rays > 0
@@ -424,6 +468,18 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
             bad += fail("contested share", share, ">", th->contested_share_max);
     }
 
+    // The cooperative claim. Both halves or neither: a floor on the union with
+    // no ceiling on the best individual would pass a fixture where one drone
+    // saw everything and the other three were redundant.
+    if (th->merged_surface_min > 0.0 && r->merged_surface < th->merged_surface_min)
+        bad += fail("merged surface", r->merged_surface, "<", th->merged_surface_min);
+    if (th->solo_surface_max > 0.0 && r->solo_surface_best > th->solo_surface_max) {
+        printf("  FAIL  %-24s %.6g > %.6g  (vehicle %d saw too much alone)\n",
+               "best solo surface", r->solo_surface_best, th->solo_surface_max,
+               r->solo_surface_best_id);
+        bad++;
+    }
+
     if (th->cone_ratio_min > 0.0 && r->cone_ratio < th->cone_ratio_min)
         bad += fail("cone size ratio", r->cone_ratio, "<", th->cone_ratio_min);
 
@@ -489,6 +545,15 @@ static void print_report(const truth_t *t, const report_t *r) {
         printf("  worst-group false-free %.5f  (group %d of %d scored)\n",
                r->group_worst_false_free, r->group_worst_id, r->group_scored);
     printf("  coverage completeness  %.5f\n", r->coverage);
+    if (t->header.thresholds.merged_surface_min > 0.0 ||
+        t->header.thresholds.solo_surface_max > 0.0) {
+        printf("  surface samples        %llu\n",
+               (unsigned long long)r->surface_samples);
+        printf("  merged surface         %.5f  (the fleet's map)\n", r->merged_surface);
+        for (int v = 0; v < t->header.vehicle_count && v < TRUTH_MAX_VEHICLES; v++)
+            printf("    vehicle %-2d           %.5f%s\n", v, r->solo_surface[v],
+                   v == r->solo_surface_best_id ? "  <- best alone" : "");
+    }
     printf("  cells occupied/free    %llu / %llu\n",
            (unsigned long long)r->occupied_cells, (unsigned long long)r->free_cells);
     printf("  contested cells        %llu  (max %.2f m from surface)\n",

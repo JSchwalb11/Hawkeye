@@ -70,6 +70,8 @@ static void print_usage(const char *prog) {
     printf("                         front, back, left, right (chase = default)\n");
     printf("  --view-span <m>        Ortho span in metres (default: fit to the map)\n");
     printf("  --follow-map           Aim the camera at the map, not the aircraft\n");
+    printf("  --map-mode <mode>      occupancy, coverage, divergence, contribution\n");
+    printf("  --focus <n>            Focus vehicle n (0-based) for contribution\n");
 }
 
 /* Thin wrapper: delegates to the testable inline in ui_logic.h */
@@ -248,6 +250,8 @@ int main(int argc, char *argv[]) {
     // camera onto the map, so the view has to be settable from the command line
     // for a recording to show anything worth recording.
     ortho_mode_t start_view = ORTHO_NONE;
+    const char *start_map_mode = NULL;   // occupancy | coverage | divergence | contribution
+    int    start_focus = -1;
     double view_span_m = 0.0;      // 0 = fit to the map
     bool   follow_map = false;
 
@@ -323,6 +327,10 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--map-origin") == 0 && i + 1 < argc) {
             map_origin_policy = (strcmp(argv[++i], "centroid") == 0)
                 ? FLEET_ORIGIN_CENTROID : FLEET_ORIGIN_FIRST_SEEN;
+        } else if (strcmp(argv[i], "--map-mode") == 0 && i + 1 < argc) {
+            start_map_mode = argv[++i];
+        } else if (strcmp(argv[i], "--focus") == 0 && i + 1 < argc) {
+            start_focus = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--view") == 0 && i + 1 < argc) {
             const char *v = argv[++i];
             if      (strcmp(v, "top") == 0)    start_view = ORTHO_TOP;

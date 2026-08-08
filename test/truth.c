@@ -107,7 +107,9 @@ int truth_writer_finish(truth_writer_t *w, const truth_header_t *h) {
     fprintf(f, "    \"vehicle0_rms_max\": %.9g,\n", t->vehicle0_rms_max);
     fprintf(f, "    \"vehicle1_rms_min\": %.9g,\n", t->vehicle1_rms_min);
     fprintf(f, "    \"group_false_free_max\": %.9g,\n", t->group_false_free_max);
-    fprintf(f, "    \"group_min_rays\": %d\n", t->group_min_rays);
+    fprintf(f, "    \"group_min_rays\": %d,\n", t->group_min_rays);
+    fprintf(f, "    \"merged_surface_min\": %.9g,\n", t->merged_surface_min);
+    fprintf(f, "    \"solo_surface_max\": %.9g\n", t->solo_surface_max);
     fprintf(f, "  }\n}\n");
 
     fclose(f);
@@ -279,6 +281,8 @@ int truth_load(truth_t *t, const char *prefix, char *err, size_t err_len) {
         x->vehicle1_rms_min     = key_num(th, "vehicle1_rms_min", 0.0);
         x->group_false_free_max = key_num(th, "group_false_free_max", 0.0);
         x->group_min_rays       = (int)key_num(th, "group_min_rays", 0);
+        x->merged_surface_min   = key_num(th, "merged_surface_min", 0.0);
+        x->solo_surface_max     = key_num(th, "solo_surface_max", 0.0);
     }
     free(buf);
 

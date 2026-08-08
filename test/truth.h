@@ -72,6 +72,12 @@ typedef struct {
     // wrong orientation-table entry among forty right ones; this can.
     double  group_false_free_max;   // 0 = unchecked
     int     group_min_rays;         // groups thinner than this are not scored
+    // The cooperative claim, as two numbers. `merged` is the share of all
+    // observed surface that the fleet's map holds; `solo` is the share the
+    // best-performing single drone contributed. A floor on the first without a
+    // ceiling on the second proves only that somebody mapped it.
+    double  merged_surface_min;     // 0 = unchecked
+    double  solo_surface_max;       // 0 = unchecked
 } truth_thresholds_t;
 
 typedef struct {

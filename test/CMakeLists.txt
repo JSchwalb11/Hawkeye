@@ -54,6 +54,7 @@ set(HAWKEYE_FIXTURES
     weak
     firehose
     endurance
+    cooperative
 )
 
 foreach(fixture ${HAWKEYE_FIXTURES})
