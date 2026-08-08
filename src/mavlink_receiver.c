@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #ifndef _WIN32
 #include <time.h>
 #endif
@@ -20,10 +21,24 @@
 #endif
 
 // MAVLink config: use common message set
-// MAVLINK_COMM_NUM_BUFFERS=16 set via CMake for multi-vehicle support
+// MAVLINK_COMM_NUM_BUFFERS=256 is set via CMake for runtime-sized fleets.
 #include <mavlink.h>
 
 #define DISCONNECT_TIMEOUT_S 2.0
+
+static void euler_to_quaternion(float roll, float pitch, float yaw, float q[4]) {
+    const float cr = cosf(roll * 0.5f);
+    const float sr = sinf(roll * 0.5f);
+    const float cp = cosf(pitch * 0.5f);
+    const float sp = sinf(pitch * 0.5f);
+    const float cy = cosf(yaw * 0.5f);
+    const float sy = sinf(yaw * 0.5f);
+
+    q[0] = cr * cp * cy + sr * sp * sy;
+    q[1] = sr * cp * cy - cr * sp * sy;
+    q[2] = cr * sp * cy + sr * cp * sy;
+    q[3] = cr * cp * sy - sr * sp * cy;
+}
 
 static void request_home_position(mavlink_receiver_t *recv) {
     if (!recv->sender_known) return;
@@ -42,6 +57,30 @@ static void request_home_position(mavlink_receiver_t *recv) {
     sendto(recv->sockfd, (char *)buf, len, 0,
            (struct sockaddr *)recv->sender_addr, sizeof(struct sockaddr_in));
     printf("Requested HOME_POSITION from system %u\n", recv->sysid);
+}
+
+static void request_message_interval(mavlink_receiver_t *recv, uint32_t message_id,
+                                     float interval_us) {
+    if (!recv->sender_known) return;
+
+    mavlink_message_t msg;
+    uint8_t buf[MAVLINK_MAX_PACKET_LEN];
+    mavlink_msg_command_long_pack(255, 0, &msg,
+        recv->sysid, 1,
+        MAV_CMD_SET_MESSAGE_INTERVAL,
+        0,
+        (float)message_id, interval_us,
+        0, 0, 0, 0, 0);
+    uint16_t len = mavlink_msg_to_send_buffer(buf, &msg);
+    sendto(recv->sockfd, (char *)buf, len, 0,
+           (struct sockaddr *)recv->sender_addr, sizeof(struct sockaddr_in));
+}
+
+static void request_native_position_stream(mavlink_receiver_t *recv) {
+    // ArduPilot does not necessarily stream these until a GCS asks. Twenty Hz
+    // is close to PX4 SIH's visualizer rate without wasting bandwidth.
+    request_message_interval(recv, MAVLINK_MSG_ID_ATTITUDE, 50000.0f);
+    request_message_interval(recv, MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 50000.0f);
 }
 
 static double get_wall_time(void) {
@@ -146,6 +185,7 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
                             recv->sysid = msg.sysid;
                             printf("Connected to system %u (type %u)\n", msg.sysid, hb.type);
                             request_home_position(recv);
+                            request_native_position_stream(recv);
                         }
                         break;
                     }
@@ -189,6 +229,45 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
                         }
                         break;
                     }
+
+                    case MAVLINK_MSG_ID_ATTITUDE: {
+                        mavlink_attitude_t attitude;
+                        mavlink_msg_attitude_decode(&msg, &attitude);
+                        euler_to_quaternion(attitude.roll, attitude.pitch,
+                                            attitude.yaw, recv->state.quaternion);
+                        recv->attitude_valid = true;
+                        recv->state.time_usec = (uint64_t)attitude.time_boot_ms * 1000ULL;
+                        recv->state.valid = recv->global_position_valid;
+
+                        if (recv->debug) {
+                            printf("  ATTITUDE: rpy=[%.3f,%.3f,%.3f] q=[%.3f,%.3f,%.3f,%.3f]\n",
+                                   attitude.roll, attitude.pitch, attitude.yaw,
+                                   recv->state.quaternion[0], recv->state.quaternion[1],
+                                   recv->state.quaternion[2], recv->state.quaternion[3]);
+                        }
+                        break;
+                    }
+
+                    case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
+                        mavlink_global_position_int_t position;
+                        mavlink_msg_global_position_int_decode(&msg, &position);
+                        recv->state.lat = position.lat;
+                        recv->state.lon = position.lon;
+                        recv->state.alt = position.alt;
+                        recv->state.vx = position.vx;
+                        recv->state.vy = position.vy;
+                        recv->state.vz = position.vz;
+                        recv->state.time_usec = (uint64_t)position.time_boot_ms * 1000ULL;
+                        recv->global_position_valid = true;
+                        recv->state.valid = recv->attitude_valid;
+
+                        if (recv->debug) {
+                            printf("  GLOBAL_POSITION_INT: lat=%d lon=%d alt=%d vel=[%d,%d,%d]\n",
+                                   position.lat, position.lon, position.alt,
+                                   position.vx, position.vy, position.vz);
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -202,6 +281,8 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
             recv->connected = false;
             recv->state.valid = false;
             recv->home.valid = false;
+            recv->attitude_valid = false;
+            recv->global_position_valid = false;
             recv->sender_known = false;
             printf("Disconnected from system %u\n", recv->sysid);
         }

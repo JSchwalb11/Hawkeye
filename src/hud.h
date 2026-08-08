@@ -36,6 +36,7 @@ typedef struct {
     float sim_time_s;
     int pinned[HUD_MAX_PINNED];   // indices of pinned vehicles (-1 = empty)
     int pinned_count;
+    int selector_page;             // zero-based page of 16 vehicle slots
     bool show_help;
     bool is_replay;     // true when data source is ULog replay (affects layout)
     bool show_yaw;      // Y key: swap HDG for YAW display

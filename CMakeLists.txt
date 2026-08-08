@@ -20,7 +20,7 @@ target_include_directories(hawkeye-core PRIVATE
     ${MAVLINK_DIR}
     ${MAVLINK_DIR}/common
 )
-target_compile_definitions(hawkeye-core PRIVATE MAVLINK_COMM_NUM_BUFFERS=16)
+target_compile_definitions(hawkeye-core PRIVATE MAVLINK_COMM_NUM_BUFFERS=256)
 if(UNIX AND NOT APPLE)
     target_link_libraries(hawkeye-core PRIVATE m)
 endif()
@@ -65,8 +65,8 @@ if(NOT BUILD_TESTING_ONLY)
         ${MAVLINK_DIR}/common
     )
 
-    # Need 16 MAVLink parse channels for multi-vehicle support
-    target_compile_definitions(hawkeye PRIVATE MAVLINK_COMM_NUM_BUFFERS=16)
+    # One parser channel per runtime vehicle (channel identifiers are uint8_t).
+    target_compile_definitions(hawkeye PRIVATE MAVLINK_COMM_NUM_BUFFERS=256)
 
     target_link_libraries(hawkeye PRIVATE raylib hawkeye-core)
 

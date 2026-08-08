@@ -42,6 +42,8 @@ typedef struct {
     double last_msg_time;        // wall-clock time of last received message
     hil_state_t state;
     home_position_t home;
+    bool attitude_valid;        // ATTITUDE received (ArduPilot/native telemetry path)
+    bool global_position_valid; // GLOBAL_POSITION_INT received
     bool sender_known;           // true once we've seen a packet
     uint8_t sender_addr[16];     // sockaddr_in stored as opaque bytes
 } mavlink_receiver_t;

@@ -1,6 +1,7 @@
 # Multi-Drone Replay (Hawkeye)
 
-Hawkeye loads up to 16 ULog files simultaneously and replays them together as a coordinated swarm.
+Hawkeye loads a runtime-sized set of ULog files (up to the 255-vehicle sanity
+limit) and replays them together as a coordinated swarm.
 This page covers the multi-drone-specific features: deconfliction when drones have different launch points, CUSUM-based takeoff alignment, and real-time correlation statistics between pinned drones.
 
 For single-log replay basics and the transport controls, see [ULog Replay](replay.md).
@@ -11,7 +12,7 @@ For single-log replay basics and the transport controls, see [ULog Replay](repla
 hawkeye --replay drone1.ulg drone2.ulg drone3.ulg
 ```
 
-Up to 16 files are supported.
+Up to 255 files are supported.
 Each becomes a replay-backed vehicle in the scene, with its own trail, markers, and telemetry.
 Hawkeye pre-scans every log (as with single-log replay) and additionally checks for conflicts between them.
 

@@ -14,6 +14,7 @@
 
 #include "raylib.h"
 #include "raymath.h"
+#include "rlgl.h"
 #include "data_source.h"
 #include "vehicle.h"
 #include "scene.h"
@@ -29,7 +30,8 @@
 #include "ui_marker_input.h"
 #include "tactical_hud.h"
 
-#define MAX_VEHICLES 16
+#define VEHICLE_SANITY_LIMIT 255
+#define FLEET_PAGE_SIZE 16
 #define EARTH_RADIUS 6371000.0
 
 #include "correlation.h"
@@ -38,8 +40,8 @@
 
 static void print_usage(const char *prog) {
     printf("Usage: %s [options]\n", prog);
-    printf("  -udp <port>    UDP base port (default: 19410)\n");
-    printf("  -n <count>     Number of vehicles (default: 1, max: %d)\n", MAX_VEHICLES);
+    printf("  -udp <port>    UDP base port (default: 19410); vehicle i uses base + i\n");
+    printf("  -n <count>     Number of vehicles (default: 1, sanity limit: %d)\n", VEHICLE_SANITY_LIMIT);
     printf("  -mc            Multicopter model (default)\n");
     printf("  -fw            Fixed-wing model\n");
     printf("  -ts            Tailsitter model\n");
@@ -144,6 +146,53 @@ static void draw_edge_indicators(const vehicle_t *vehicles, int vehicle_count,
     }
 }
 
+static void draw_density_heatmap(const vehicle_t *vehicles, int vehicle_count,
+                                 const theme_t *theme) {
+    enum { HEAT_COLS = 14, HEAT_ROWS = 12 };
+    int density[HEAT_COLS * HEAT_ROWS] = {0};
+    float min_x = INFINITY, max_x = -INFINITY;
+    float min_z = INFINITY, max_z = -INFINITY;
+    int active = 0;
+
+    for (int i = 0; i < vehicle_count; i++) {
+        if (!vehicles[i].active) continue;
+        float x = vehicles[i].position.x;
+        float z = vehicles[i].position.z;
+        if (x < min_x) min_x = x;
+        if (x > max_x) max_x = x;
+        if (z < min_z) min_z = z;
+        if (z > max_z) max_z = z;
+        active++;
+    }
+    if (!active) return;
+    if (max_x - min_x < 1.0f) { min_x -= 0.5f; max_x += 0.5f; }
+    if (max_z - min_z < 1.0f) { min_z -= 0.5f; max_z += 0.5f; }
+
+    for (int i = 0; i < vehicle_count; i++) {
+        if (!vehicles[i].active) continue;
+        int x = (int)((vehicles[i].position.x - min_x) / (max_x - min_x) * HEAT_COLS);
+        int z = (int)((vehicles[i].position.z - min_z) / (max_z - min_z) * HEAT_ROWS);
+        if (x == HEAT_COLS) x--;
+        if (z == HEAT_ROWS) z--;
+        density[z * HEAT_COLS + x]++;
+    }
+
+    const float cell_x = (max_x - min_x) / HEAT_COLS;
+    const float cell_z = (max_z - min_z) / HEAT_ROWS;
+    for (int z = 0; z < HEAT_ROWS; z++) {
+        for (int x = 0; x < HEAT_COLS; x++) {
+            int count = density[z * HEAT_COLS + x];
+            if (!count) continue;
+            Color color = theme->hud_accent;
+            int alpha = 20 + count * 18;
+            color.a = (unsigned char)(alpha > 110 ? 110 : alpha);
+            DrawCube((Vector3){min_x + (x + 0.5f) * cell_x, 0.015f,
+                               min_z + (z + 0.5f) * cell_z},
+                     cell_x * 0.94f, 0.02f, cell_z * 0.94f, color);
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     uint16_t base_port = 19410;
     int vehicle_count = 1;
@@ -156,7 +205,8 @@ int main(int argc, char *argv[]) {
     double origin_lon = 8.545594;
     double origin_alt = 489.4;
     bool origin_specified = false;
-    char *replay_paths[MAX_VEHICLES] = {0};
+    char **replay_paths = calloc(VEHICLE_SANITY_LIMIT, sizeof(*replay_paths));
+    if (!replay_paths) return 1;
     int num_replay_files = 0;
     bool ghost_mode = false;
 
@@ -164,9 +214,15 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "-udp") == 0 && i + 1 < argc) {
             base_port = (uint16_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
-            vehicle_count = atoi(argv[++i]);
-            if (vehicle_count < 1) vehicle_count = 1;
-            if (vehicle_count > MAX_VEHICLES) vehicle_count = MAX_VEHICLES;
+            char *end = NULL;
+            long requested = strtol(argv[++i], &end, 10);
+            if (!end || *end != '\0' || requested < 1 || requested > VEHICLE_SANITY_LIMIT) {
+                fprintf(stderr, "Invalid vehicle count '%s': -n must be between 1 and %d\n",
+                        argv[i], VEHICLE_SANITY_LIMIT);
+                free(replay_paths);
+                return 1;
+            }
+            vehicle_count = (int)requested;
         } else if (strcmp(argv[i], "-origin") == 0 && i + 3 < argc) {
             origin_lat = atof(argv[++i]);
             origin_lon = atof(argv[++i]);
@@ -186,8 +242,8 @@ int main(int argc, char *argv[]) {
             win_h = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--replay") == 0) {
             while (i + 1 < argc && argv[i + 1][0] != '-') {
-                if (num_replay_files >= MAX_VEHICLES) {
-                    fprintf(stderr, "Too many replay files (max %d)\n", MAX_VEHICLES);
+                if (num_replay_files >= VEHICLE_SANITY_LIMIT) {
+                    fprintf(stderr, "Too many replay files (max %d)\n", VEHICLE_SANITY_LIMIT);
                     return 1;
                 }
                 replay_paths[num_replay_files++] = argv[++i];
@@ -195,8 +251,8 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--ghost") == 0) {
             ghost_mode = true;
             while (i + 1 < argc && argv[i + 1][0] != '-') {
-                if (num_replay_files >= MAX_VEHICLES) {
-                    fprintf(stderr, "Too many replay files (max %d)\n", MAX_VEHICLES);
+                if (num_replay_files >= VEHICLE_SANITY_LIMIT) {
+                    fprintf(stderr, "Too many replay files (max %d)\n", VEHICLE_SANITY_LIMIT);
                     return 1;
                 }
                 replay_paths[num_replay_files++] = argv[++i];
@@ -207,6 +263,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if ((unsigned int)base_port + (unsigned int)vehicle_count > 65535U) {
+        fprintf(stderr, "Invalid UDP port range: base port %u with %d vehicles exceeds 65535\n",
+                base_port, vehicle_count);
+        free(replay_paths);
+        return 1;
+    }
+
     asset_path_init();
 
     // Init Raylib
@@ -215,9 +278,9 @@ int main(int argc, char *argv[]) {
     SetTargetFPS(60);
 
     // Init data sources
-    data_source_t sources[MAX_VEHICLES];
-    memset(sources, 0, sizeof(sources));
     bool is_replay = (num_replay_files > 0);
+    if (is_replay) vehicle_count = num_replay_files;
+    data_source_t *sources = calloc((size_t)vehicle_count, sizeof(*sources));
 
     if (is_replay) {
         for (int i = 0; i < num_replay_files; i++) {
@@ -227,7 +290,6 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-        vehicle_count = num_replay_files;
     } else {
         for (int i = 0; i < vehicle_count; i++) {
             if (data_source_mavlink_create(&sources[i], base_port + i, (uint8_t)i, debug) != 0) {
@@ -243,19 +305,24 @@ int main(int argc, char *argv[]) {
     scene_t scene;
     scene_init(&scene);
 
-    vehicle_t vehicles[MAX_VEHICLES];
-    corr_state_t corr[MAX_VEHICLES];
-    memset(corr, 0, sizeof(corr));
+    vehicle_t *vehicles = calloc((size_t)vehicle_count, sizeof(*vehicles));
+    corr_state_t *corr = calloc((size_t)vehicle_count, sizeof(*corr));
+    if (!sources || !vehicles || !corr) {
+        fprintf(stderr, "Failed to allocate state for %d vehicles\n", vehicle_count);
+        free(replay_paths); free(sources); free(vehicles); free(corr);
+        CloseWindow();
+        return 1;
+    }
     if (is_replay) {
         // Persistent trail for replay: 36000 points (~10+ min at adaptive rate)
         for (int i = 0; i < num_replay_files; i++) {
             vehicle_init_ex(&vehicles[i], model_idx, scene.lighting_shader, 36000);
-            vehicles[i].color = scene.theme->drone_palette[i % 16];
+            vehicles[i].color = scene.theme->drone_palette[i % THEME_DRONE_PALETTE_SIZE];
         }
     } else {
         for (int i = 0; i < vehicle_count; i++) {
             vehicle_init(&vehicles[i], model_idx, scene.lighting_shader);
-            vehicles[i].color = scene.theme->drone_palette[i];
+            vehicles[i].color = scene.theme->drone_palette[i % THEME_DRONE_PALETTE_SIZE];
         }
     }
 
@@ -385,8 +452,7 @@ int main(int argc, char *argv[]) {
     }
 
     // Compute position tier per vehicle (for debug panel)
-    int vehicle_tier[MAX_VEHICLES];
-    memset(vehicle_tier, 0, sizeof(vehicle_tier));
+    int *vehicle_tier = calloc((size_t)vehicle_count, sizeof(*vehicle_tier));
     if (is_replay) {
         for (int i = 0; i < num_replay_files; i++) {
             if (sources[i].playback.home_from_topic) vehicle_tier[i] = 1;
@@ -420,16 +486,14 @@ int main(int argc, char *argv[]) {
 
     int selected = 0;
     int prev_selected = 0;
-    bool was_connected[MAX_VEHICLES];
-    memset(was_connected, 0, sizeof(was_connected));
-    Vector3 last_pos[MAX_VEHICLES];
-    memset(last_pos, 0, sizeof(last_pos));
+    bool *was_connected = calloc((size_t)vehicle_count, sizeof(*was_connected));
+    Vector3 *last_pos = calloc((size_t)vehicle_count, sizeof(*last_pos));
     bool show_hud = true;
     float saved_chase_distance = 0.0f;
     float tactical_chase_target = 1.6f;
 
     // Key chord state for two-digit drone selection (10-16)
-    int chord_first = -1;       // first digit pressed (-1 = no chord in progress)
+    int chord_value = -1;       // accumulated 1-based vehicle number
     double chord_time = 0.0;    // when first digit was pressed
     bool chord_shift = false;   // whether shift was held on first digit
     int trail_mode = (num_replay_files > 1) ? 3 : 1;  // multi-drone defaults to ID trails
@@ -439,17 +503,25 @@ int main(int argc, char *argv[]) {
     int corr_mode = 0;               // Shift+T: 0=off, 1=ribbon, 2=line
     bool show_corr_labels = true;    // Ctrl+L: distance labels in ortho correlation
     bool show_axes = false;          // Z: axis orientation gizmo
-    bool insufficient_data[MAX_VEHICLES];  // drones with no position data
-    memset(insufficient_data, 0, sizeof(insufficient_data));
-    float prev_playback_pos[MAX_VEHICLES];
-    memset(prev_playback_pos, 0, sizeof(prev_playback_pos));
+    bool *insufficient_data = calloc((size_t)vehicle_count, sizeof(*insufficient_data));
+    float *prev_playback_pos = calloc((size_t)vehicle_count, sizeof(*prev_playback_pos));
     int insufficient_check_frames = 0;
     bool insufficient_toasted = false;
 
     // Per-drone markers, system markers, and pre-computed trails
-    user_markers_t markers[MAX_VEHICLES] = {0};
-    sys_markers_t sys_markers[MAX_VEHICLES] = {0};
-    precomp_trail_t precomp[MAX_VEHICLES] = {0};
+    user_markers_t *markers = calloc((size_t)vehicle_count, sizeof(*markers));
+    sys_markers_t *sys_markers = calloc((size_t)vehicle_count, sizeof(*sys_markers));
+    precomp_trail_t *precomp = calloc((size_t)vehicle_count, sizeof(*precomp));
+    hud_marker_data_t *all_user_md = calloc((size_t)vehicle_count, sizeof(*all_user_md));
+    hud_marker_data_t *all_sys_md = calloc((size_t)vehicle_count, sizeof(*all_sys_md));
+    if (!vehicle_tier || !was_connected || !last_pos || !insufficient_data ||
+        !prev_playback_pos || !markers || !sys_markers || !precomp ||
+        !all_user_md || !all_sys_md) {
+        fprintf(stderr, "Failed to allocate per-vehicle UI state for %d vehicles\n",
+                vehicle_count);
+        CloseWindow();
+        return 1;
+    }
     for (int i = 0; i < vehicle_count; i++) {
         markers[i].current = -1;
         markers[i].last_drop_idx = -1;
@@ -575,8 +647,11 @@ int main(int argc, char *argv[]) {
         if (is_replay && num_replay_files > 1) {
             // Reset accumulators when selection changes
             if (selected != prev_selected) {
-                memset(corr, 0, sizeof(corr));
-                for (int i = 0; i < num_replay_files; i++) {
+                memset(corr, 0, (size_t)vehicle_count * sizeof(*corr));
+                int corr_page_first = (selected / FLEET_PAGE_SIZE) * FLEET_PAGE_SIZE;
+                int corr_page_last = corr_page_first + FLEET_PAGE_SIZE;
+                if (corr_page_last > num_replay_files) corr_page_last = num_replay_files;
+                for (int i = corr_page_first; i < corr_page_last; i++) {
                     sources[i].playback.correlation = NAN;
                     sources[i].playback.rmse = NAN;
                 }
@@ -590,7 +665,10 @@ int main(int argc, char *argv[]) {
                 double rx[CORR_CHANNELS] = {
                     ref->position.z, ref->position.x, ref->position.y
                 };
-                for (int i = 0; i < num_replay_files; i++) {
+                int page_first = (selected / FLEET_PAGE_SIZE) * FLEET_PAGE_SIZE;
+                int page_last = page_first + FLEET_PAGE_SIZE;
+                if (page_last > num_replay_files) page_last = num_replay_files;
+                for (int i = page_first; i < page_last; i++) {
                     if (i == selected || !vehicles[i].origin_set) continue;
                     const vehicle_t *v = &vehicles[i];
                     double vx[CORR_CHANNELS] = {
@@ -794,7 +872,7 @@ int main(int argc, char *argv[]) {
         // Update vehicle colors when view mode changes
         {
             for (int i = 0; i < vehicle_count; i++)
-                vehicles[i].color = scene.theme->drone_palette[i];
+                vehicles[i].color = scene.theme->drone_palette[i % THEME_DRONE_PALETTE_SIZE];
         }
 
         // Help overlay toggle (? key = Shift+/)
@@ -878,6 +956,30 @@ int main(int argc, char *argv[]) {
 
         // Vehicle selection input
         if (vehicle_count > 1) {
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+                GetMouseY() < GetScreenHeight() - hud_bar_height(&hud, GetScreenHeight())) {
+                Ray ray = GetMouseRay(GetMousePosition(), scene.camera);
+                float nearest = INFINITY;
+                int hit = -1;
+                for (int i = 0; i < vehicle_count; i++) {
+                    if (!vehicles[i].active) continue;
+                    float radius = (i == selected || vehicle_count <= 16)
+                                     ? vehicles[i].model_scale : 0.35f;
+                    RayCollision collision = GetRayCollisionSphere(
+                        ray, vehicles[i].position, fmaxf(radius, 0.25f));
+                    if (collision.hit && collision.distance < nearest) {
+                        nearest = collision.distance;
+                        hit = i;
+                    }
+                }
+                if (hit >= 0) {
+                    selected = hit;
+                    hud.selector_page = selected / FLEET_PAGE_SIZE;
+                    hud.pinned_count = 0;
+                    memset(hud.pinned, -1, sizeof(hud.pinned));
+                    chord_value = -1;
+                }
+            }
             if (IsKeyPressed(KEY_TAB)) {
                 // Cycle to next connected vehicle, clear pins
                 for (int j = 1; j <= vehicle_count; j++) {
@@ -886,28 +988,20 @@ int main(int argc, char *argv[]) {
                 }
                 hud.pinned_count = 0;
                 memset(hud.pinned, -1, sizeof(hud.pinned));
-                chord_first = -1;
+                chord_value = -1;
+                hud.selector_page = selected / FLEET_PAGE_SIZE;
             }
             if (IsKeyPressed(KEY_LEFT_BRACKET) && !is_replay) {
-                for (int j = 1; j <= vehicle_count; j++) {
-                    int prev = (selected - j + vehicle_count) % vehicle_count;
-                    if (sources[prev].connected) { selected = prev; break; }
-                }
-                hud.pinned_count = 0;
-                memset(hud.pinned, -1, sizeof(hud.pinned));
-                chord_first = -1;
+                int pages = (vehicle_count + FLEET_PAGE_SIZE - 1) / FLEET_PAGE_SIZE;
+                hud.selector_page = (hud.selector_page + pages - 1) % pages;
+                chord_value = -1;
             }
             if (IsKeyPressed(KEY_RIGHT_BRACKET) && !is_replay) {
-                for (int j = 1; j <= vehicle_count; j++) {
-                    int next = (selected + j) % vehicle_count;
-                    if (sources[next].connected) { selected = next; break; }
-                }
-                hud.pinned_count = 0;
-                memset(hud.pinned, -1, sizeof(hud.pinned));
-                chord_first = -1;
+                int pages = (vehicle_count + FLEET_PAGE_SIZE - 1) / FLEET_PAGE_SIZE;
+                hud.selector_page = (hud.selector_page + 1) % pages;
+                chord_value = -1;
             }
-            // Number keys 0-9: single digit or two-digit chord for drones 10-16
-            // Chord: press first digit, then second within 300ms (e.g. 1+0 = drone 10)
+            // Number chords accept every digit required by the runtime fleet size.
             {
                 int digit = -1;
                 for (int k = KEY_ZERO; k <= KEY_NINE; k++) {
@@ -919,38 +1013,29 @@ int main(int argc, char *argv[]) {
                 bool alt_held = IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT);
 
                 // Check chord timeout
-                if (chord_first >= 0 && GetTime() - chord_time > CHORD_TIMEOUT_S) {
-                    // Timeout: apply first digit as single-digit selection
-                    int idx = chord_first - 1;  // digit 1 = drone index 0
-                    if (idx >= 0 && idx < vehicle_count)
+                if (chord_value >= 0 && GetTime() - chord_time > CHORD_TIMEOUT_S) {
+                    int idx = chord_value - 1;  // digit 1 = drone index 0
+                    if (idx >= 0 && idx < vehicle_count) {
                         apply_vehicle_selection_hud(&hud, idx, chord_shift, &selected, vehicle_count);
-                    chord_first = -1;
+                        hud.selector_page = selected / FLEET_PAGE_SIZE;
+                    }
+                    chord_value = -1;
                 }
 
                 if (digit >= 0 && !ctrl_held && !alt_held) {
-                    if (chord_first >= 0) {
-                        // Second digit of chord: combine into two-digit number
-                        int two_digit = chord_first * 10 + digit;
-                        int idx = two_digit - 1;  // drone 10 = index 9
-                        chord_first = -1;
-
-                        if (idx >= 0 && idx < vehicle_count)
-                            apply_vehicle_selection_hud(&hud, idx, chord_shift, &selected, vehicle_count);
-                    } else if (digit >= 1 && digit <= 9) {
-                        // First digit: start chord or apply immediately if vehicle_count <= 9
-                        if (vehicle_count > 9) {
-                            // Could be start of two-digit chord
-                            chord_first = digit;
-                            chord_time = GetTime();
-                            chord_shift = shift_held;
-                        } else {
-                            // No need for chords, apply single digit immediately
-                            int idx = digit - 1;
-                            if (idx < vehicle_count)
-                                apply_vehicle_selection_hud(&hud, idx, shift_held, &selected, vehicle_count);
-                        }
+                    if (chord_value < 0 && digit > 0) {
+                        chord_value = digit;
+                        chord_shift = shift_held;
+                    } else if (chord_value >= 0 && chord_value <= VEHICLE_SANITY_LIMIT / 10) {
+                        chord_value = chord_value * 10 + digit;
                     }
-                    // Note: digit 0 alone is ignored (no drone 0); only valid as chord second digit
+                    chord_time = GetTime();
+                    if (vehicle_count <= 9 && chord_value > 0) {
+                        apply_vehicle_selection_hud(&hud, chord_value - 1, chord_shift,
+                                                    &selected, vehicle_count);
+                        hud.selector_page = selected / FLEET_PAGE_SIZE;
+                        chord_value = -1;
+                    }
                 }
             }
         }
@@ -1202,11 +1287,31 @@ int main(int argc, char *argv[]) {
 
             BeginMode3D(scene.camera);
                 scene_draw(&scene);
+                if (vehicle_count > 60) {
+                    draw_density_heatmap(vehicles, vehicle_count, scene.theme);
+                    rlPointSize(2.0f);
+                    for (int c = 0; c < THEME_DRONE_PALETTE_SIZE; c++) {
+                        Color color = scene.theme->drone_palette[c];
+                        rlBegin(RL_POINTS);
+                        rlColor4ub(color.r, color.g, color.b, color.a);
+                        for (int i = c; i < vehicle_count; i += THEME_DRONE_PALETTE_SIZE) {
+                            if (i == selected || !vehicles[i].active) continue;
+                            rlVertex3f(vehicles[i].position.x, vehicles[i].position.y,
+                                       vehicles[i].position.z);
+                        }
+                        rlEnd();
+                    }
+                }
                 for (int i = 0; i < vehicle_count; i++) {
                     if (vehicles[i].active || vehicle_count == 1) {
-                        vehicle_draw(&vehicles[i], scene.theme, i == selected,
-                                     tm_3d, show_ground_track, scene.camera.position,
-                                     classic_colors);
+                        if (vehicle_count <= 16 || i == selected) {
+                            vehicle_draw(&vehicles[i], scene.theme, i == selected,
+                                         (i == selected || vehicle_count <= 16) ? tm_3d : 0,
+                                         show_ground_track, scene.camera.position,
+                                         classic_colors);
+                        } else if (vehicle_count <= 60) {
+                            DrawSphere(vehicles[i].position, 0.18f, vehicles[i].color);
+                        }
                     }
                 }
                 // Draw frame marker spheres and system marker cubes for all drones
@@ -1289,6 +1394,22 @@ int main(int argc, char *argv[]) {
                 }
             EndMode3D();
 
+            // Colour repeats after the finite palette; the runtime index never does.
+            if (vehicle_count > 16) {
+                for (int i = 0; i < vehicle_count; i++) {
+                    if (vehicle_count > 60 && i != selected) continue;
+                    if (!vehicles[i].active) continue;
+                    Vector2 p = GetWorldToScreen(vehicles[i].position, scene.camera);
+                    char label[16];
+                    snprintf(label, sizeof(label), "%d", i + 1);
+                    float fs = (i == selected) ? 16.0f : 11.0f;
+                    Vector2 size = MeasureTextEx(hud.font_label, label, fs, 0.5f);
+                    DrawTextEx(hud.font_label, label,
+                               (Vector2){p.x - size.x / 2, p.y - 18}, fs, 0.5f,
+                               i == selected ? WHITE : vehicles[i].color);
+                }
+            }
+
             // Ortho ground fill (2D overlay)
             scene_draw_ortho_ground(&scene, GetScreenWidth(), GetScreenHeight());
 
@@ -1343,8 +1464,6 @@ int main(int argc, char *argv[]) {
             if (show_hud) {
                 bool has_awaiting_gps = vehicles[selected].active &&
                     !vehicles[selected].origin_set && sources[selected].home.valid;
-                hud_marker_data_t all_user_md[MAX_VEHICLES] = {0};
-                hud_marker_data_t all_sys_md[MAX_VEHICLES] = {0};
                 for (int i = 0; i < vehicle_count; i++) {
                     all_user_md[i] = (hud_marker_data_t){
                         .times = markers[i].times,
@@ -1438,6 +1557,11 @@ int main(int argc, char *argv[]) {
     scene_cleanup(&scene);
     for (int i = 0; i < vehicle_count; i++)
         precomp_trail_cleanup(&precomp[i]);
+    free(replay_paths);
+    free(sources); free(vehicles); free(corr); free(vehicle_tier);
+    free(was_connected); free(last_pos); free(insufficient_data);
+    free(prev_playback_pos); free(markers); free(sys_markers); free(precomp);
+    free(all_user_md); free(all_sys_md);
     CloseWindow();
 
     return 0;

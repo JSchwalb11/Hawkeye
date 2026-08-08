@@ -1,6 +1,7 @@
 # Data Sources
 
-Hawkeye consumes telemetry from two sources: live MAVLink streams (from PX4 SITL) and ULog file replay.
+Hawkeye consumes telemetry from live MAVLink streams (including PX4 and
+ArduPilot SITL) and from ULog replay.
 
 ## MAVLink messages (live mode)
 
@@ -8,9 +9,15 @@ Hawkeye consumes telemetry from two sources: live MAVLink streams (from PX4 SITL
 | ---------------------- | ------------------------------------------------------ |
 | `HEARTBEAT`            | Vehicle type, arming state, autopilot mode             |
 | `HIL_STATE_QUATERNION` | Position, attitude, velocity, airspeed                 |
+| `ATTITUDE`             | Euler attitude for native non-HIL streams              |
 | `STATUSTEXT`           | Warning and log messages (severity 0–7)                |
 | `HOME_POSITION`        | Authoritative home location                            |
-| `GLOBAL_POSITION_INT`  | GPS latitude, longitude, altitude (fallback reference) |
+| `GLOBAL_POSITION_INT`  | Position and velocity paired with `ATTITUDE`            |
+
+PX4 SIH normally supplies `HIL_STATE_QUATERNION`. For autopilots such as
+ArduPilot that do not emit that HIL message, Hawkeye requests `ATTITUDE` and
+`GLOBAL_POSITION_INT` at 20 Hz after the heartbeat and combines them into the
+same internal vehicle state. No telemetry bridge is required.
 
 ## ULog topics (replay mode)
 
