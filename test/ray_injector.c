@@ -1210,5 +1210,6 @@ int main(int argc, char **argv) {
     printf("fixture=%s vehicles=%d duration=%.1fs messages=%llu rays=%u\n",
            s.def->name, s.vehicles, s.duration_s,
            (unsigned long long)s.em.messages, s.truth.ray_count);
+    splat_free(&s.cloud);
     return rc;
 }

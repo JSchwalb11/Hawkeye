@@ -1046,6 +1046,7 @@ int main(int argc, char **argv) {
     memset(&rep, 0, sizeof(rep));
     if (replay_tlog(&ms, tlog_path, &truth, &rep) != 0) {
         map_session_free(&ms);
+        splat_free(&cloud);
         truth_free(&truth);
         return 1;
     }

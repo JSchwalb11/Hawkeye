@@ -7,7 +7,6 @@
 // swamped by forty correct ones. Each case here was a real defect found in
 // review; each asserts the specific thing that was broken.
 
-#include <assert.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,8 +139,14 @@ static void test_orientation_table(void) {
     // 39 (PITCH_315) aims 45 degrees down; 40 (ROLL_90_PITCH_315) shares that
     // boresight. Before entry 40 existed it fell off the end of the table and
     // came out as a phantom obstacle 10 m dead ahead at flight level.
+    // Never put a call inside assert(): NDEBUG compiles the whole expression
+    // away, so in a release build the ray would never be built and everything
+    // after this would compare uninitialised stack.
     o.orientation = 39;
-    assert(rt_build_ray(&o, &ray));
+    if (!rt_build_ray(&o, &ray)) {
+        check(false, "orientation 39 builds a ray");
+        return;
+    }
     const float down39 = ray.endpoint[2];
 
     o.orientation = 40;
@@ -218,7 +223,10 @@ static void test_pool_uses_full_budget(void) {
     octomap_config_t cfg;
     octomap_config_defaults(&cfg);
     cfg.byte_cap = cap_bytes;
-    assert(octomap_init(&m, &cfg) == 0);
+    if (octomap_init(&m, &cfg) != 0) {
+        check(false, "the map initialises with a 16 MiB cap");
+        return;
+    }
 
     // Enough scattered rays to exhaust the budget several times over.
     uint32_t seed = 12345u;
