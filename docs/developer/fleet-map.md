@@ -207,3 +207,8 @@ derived inter-vehicle separation matrix and its closest pair.
 ## Fixtures
 
 See [fleet-map-fixtures.md](fleet-map-fixtures.md).
+
+## Deferred work
+
+See [follow-ups.md](follow-ups.md) — five items, each with the measurement that
+motivates it and the ones that were already tried and did not help.
