@@ -51,6 +51,14 @@ typedef struct {
     // absolute ceiling can, and a deterministic fixture can assert one.
     int64_t live_nodes_max;        // 0 = unchecked
     int64_t prune_blocks_min;      // blocks pruning must have reclaimed, 0 = unchecked
+    // Ceiling on how many times the prune pass may run across the whole replay.
+    //
+    // A deterministic counter, which a wall-clock throughput floor is not: the
+    // regression this guards against is a full-tree walk per drain, and on this
+    // machine that is 13,617 passes against 132. Asserting the count rather
+    // than the resulting rays/s means the check has the same teeth on a slow CI
+    // runner as on a fast workstation. 0 = unchecked.
+    int64_t prune_passes_max;
     double  min_rays_per_s;        // 0 = unchecked
     int     require_drops;         // 1 = drops must be non-zero and reported
     double  contested_max_dist_m;  // contested cells must sit within this of the offset band

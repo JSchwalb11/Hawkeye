@@ -143,6 +143,14 @@ double octomap_cell_size(const octomap_t *m, int depth);
 int    octomap_depth_for_size(const octomap_t *m, double size_m);
 size_t octomap_bytes(const octomap_t *m);
 
+// Bytes actually holding tree, ignoring pool the free list is sitting on.
+//
+// `octomap_bytes` reports capacity, and the pool never shrinks -- so it can
+// only ever rise, and anything that compares it against the cap to decide
+// "the map is getting full" latches on permanently the first time the pool
+// grows. This is the figure that falls again when pruning reclaims blocks.
+size_t octomap_live_bytes(const octomap_t *m);
+
 // --- Insertion ---------------------------------------------------------
 
 typedef struct {

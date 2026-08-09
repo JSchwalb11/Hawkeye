@@ -57,6 +57,9 @@ typedef struct {
     uint32_t  budget;
     float     prune_interval_s;
     float     prune_pressure;
+    // The last prune pass reclaimed nothing, so pressure alone will not
+    // trigger another -- only the interval will. See maintain().
+    bool      prune_barren;
     float     since_prune_s;
 
     // Rate smoothing, updated once per tick.

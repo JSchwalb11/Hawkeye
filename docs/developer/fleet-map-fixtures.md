@@ -49,6 +49,7 @@ nothing.
 | `weak` | degrading `signal_quality`, rising `covariance` | evidence weighting |
 | `firehose` | 72 sectors × 20 Hz × N vehicles | throughput, the ray-drop path, and that drops are **reported** |
 | `endurance` | 32 simulated minutes over a bounded volume | pruning: memory must plateau, not climb |
+| `pressure` | the same box, over-resolved against an 8 MiB ceiling | the map *at* its cap: pruning must not thrash |
 
 ### Why `orientations` transcribes the enum twice
 

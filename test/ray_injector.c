@@ -58,7 +58,7 @@
 typedef enum {
     FX_EMPTY = 0, FX_GROUND, FX_WALL, FX_CORRIDOR, FX_ORIENTATIONS, FX_MOVING,
     FX_TWO_ORIGINS, FX_DISAGREEMENT, FX_VANISHING, FX_CONE, FX_WEAK,
-    FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_COOPERATIVE,
+    FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_PRESSURE, FX_COOPERATIVE,
     FX_STATUE_SOLO, FX_STATUE_FLEET, FX_STATUE_PRECISION, FX_COUNT
 } fixture_id_t;
 
@@ -81,6 +81,16 @@ typedef struct {
     // still a world; only its representation changes, and nothing about it
     // reaches the viewer -- the wire still carries DISTANCE_SENSOR.
     bool          splat_world;
+    // Map memory ceiling in MiB; 0 takes the 512 MiB default. Only `pressure`
+    // sets it, and it sets it low enough that the map genuinely runs against
+    // the cap for most of the flight rather than fitting comfortably inside.
+    unsigned      byte_cap_mib;
+    // Leaf depth override; 0 takes the fixture default. `pressure` deliberately
+    // runs finer than its 5-degree sector can justify: the job is to fill the
+    // node pool and hold the map against its ceiling, not to map anything well,
+    // and its accuracy thresholds are set to what an over-resolved map at its
+    // cap can actually do.
+    unsigned      max_depth;
 } fixture_def_t;
 
 static const fixture_def_t k_fixtures[FX_COUNT] = {
@@ -260,6 +270,34 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         // uniformly and the ratio actually improves. These two are what notice.
         .live_nodes_max = 60000, .prune_blocks_min = 100000,
     }, 0, 0, 16 },
+
+    // The map at its memory ceiling, which is a different regime from the map
+    // with room to grow: subdivision is refused rather than granted, so the
+    // tree stops changing shape and pruning starts finding the same unprunable
+    // nodes over and over.
+    //
+    // This fixture exists because that used to cost everything. Pruning was
+    // triggered by comparing the node pool's *capacity* against the cap, and a
+    // pool never shrinks -- so once the map had grown, every drain ran a full
+    // tree walk forever. The map stayed correct and simply crawled, which is
+    // why no existing fixture noticed: they all assert what the map contains,
+    // and this one asserts what it costs.
+    //
+    // `prune_passes_max` is the assertion that matters, and it is a count
+    // rather than a rate on purpose: the old trigger ran 13,617 passes here
+    // against 132, and a deterministic counter has the same teeth on a slow CI
+    // runner as on a fast workstation. The throughput floor is kept as a coarse
+    // backstop only.
+    //
+    // `prune_blocks_min` is the other half of the pair: without it, "few
+    // passes" could be bought by never pruning at all, which would pass the
+    // ceiling and quietly break the memory plateau `endurance` asserts.
+    [FX_PRESSURE] = { "pressure", 240.0, 2, 20.0, SENSOR_OBSTACLE, 1, {
+        .surface_rms_max_m = 0.80, .false_occupied_max = 0.45, .false_free_max = 0.20,
+        .coverage_min = 0.85, .occupied_cells_min = 500, .occupied_cells_max = -1,
+        .prune_passes_max = 500, .prune_blocks_min = 50000,
+        .min_rays_per_s = 10000.0,
+    }, 0, 0, 16, false, 8, 14 },
 };
 
 // ------------------------------------------------------------ RNG
@@ -393,9 +431,10 @@ static void build_scene(fixture_id_t fx, geom_scene_t *s) {
             add_plane(s, 0, 0, 5, 0, 1, 0, 24, 5, "divider-ew");
             break;
 
+        case FX_PRESSURE:
         case FX_ENDURANCE:
-            // A bounded box: the endurance fixture needs the volume closed so
-            // memory has something to plateau at.
+            // A bounded box: these two need the volume closed so memory has
+            // something to plateau at, and something to run out against.
             add_plane(s, -20, 0, 8, 1, 0, 0, 20, 8, "west");
             add_plane(s,  20, 0, 8, -1, 0, 0, 20, 8, "east");
             add_plane(s, 0, -20, 8, 0, 1, 0, 20, 8, "south");
@@ -588,6 +627,7 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             break;
         }
 
+        case FX_PRESSURE:
         case FX_ENDURANCE: {
             const double phase = t * 0.05 + (double)veh * (2.0 * M_PI / 8.0);
             p->enu[0] = 10.0 * cos(phase);
@@ -1135,10 +1175,13 @@ static int run(sim_t *s, uint32_t seed, double scale) {
         h.max_depth = 12;      // 0.25 m leaves, as elsewhere
         h.coarse_depth = 9;
     }
+    if (s->def->max_depth) h.max_depth = (int)s->def->max_depth;
     h.skip_near_m = 1.0;
     h.queue_capacity = s->def->queue_capacity;
     h.budget_per_drain = s->def->budget_per_drain;
-    h.map_byte_cap = (size_t)512 * 1024 * 1024;
+    h.map_byte_cap = s->def->byte_cap_mib
+        ? (size_t)s->def->byte_cap_mib * 1024 * 1024
+        : (size_t)512 * 1024 * 1024;
     snprintf(h.splat_path, sizeof(h.splat_path), "%s", s->splat_path);
     snprintf(h.mesh_path, sizeof(h.mesh_path), "%s", s->mesh_path);
     h.thresholds = s->def->th;

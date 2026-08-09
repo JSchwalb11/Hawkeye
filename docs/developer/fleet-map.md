@@ -131,6 +131,19 @@ log-odds increment, so a weak return moves the map less than a clean one.
 is what makes memory plateau rather than climb, and the `endurance` fixture
 asserts the plateau over 32 simulated minutes.
 
+*When* it runs matters as much as what it does, because a pass is a full walk
+of the tree. It fires on an interval, and early when the map is getting full —
+but "full" is measured with `octomap_live_bytes`, which discounts the free
+list, **not** `octomap_bytes`, which reports pool capacity and can only ever
+rise. Measuring against capacity meant that once a map had grown past the
+pressure fraction it stayed above it for the rest of the session, and a full
+walk ran on every drain: 13,617 passes against 132 on the `pressure` fixture,
+with sustained throughput falling from 174k rays/s to 14k. A pass that reclaims
+nothing also stands the map down to the interval schedule, because at the cap
+subdivision is refused, the tree stops changing shape, and every pass then
+finds the same unprunable nodes. `pressure` asserts the pass *count*, which is
+deterministic where a rays/s floor is not.
+
 **Divergence** is a fleet signal. When new evidence contradicts a confident cell
 *and* comes from a vehicle other than the ones already on record, `disagree` is
 incremented; above a threshold the cell is contested and rendered distinctly.
@@ -207,3 +220,8 @@ derived inter-vehicle separation matrix and its closest pair.
 ## Fixtures
 
 See [fleet-map-fixtures.md](fleet-map-fixtures.md).
+
+## Deferred work
+
+See [follow-ups.md](follow-ups.md) — five items, each with the measurement that
+motivates it and the ones that were already tried and did not help.
