@@ -432,11 +432,15 @@ static void node_apply(octomap_t *m, uint32_t idx, int delta, uint8_t vehicle_id
     // has ever been hit moves it by 0.002; stopping each ray's own carve 10 cm
     // short of its endpoint moves it by 0.003. All three arrive too late.
     //
-    // Clearing on the hit is order-independent and costs no state. It says a
-    // present-tense range return is authoritative about a cell over any amount
-    // of inference drawn from rays that merely passed nearby -- and, because it
-    // fires only on a hit, an obstacle that is genuinely removed still gets no
-    // resets and still carves away to free, which is what `vanishing` checks.
+    // Clearing on the hit costs no state. It says a present-tense range return
+    // is authoritative about a cell over any amount of inference drawn from
+    // rays that merely passed nearby -- and, because it fires only on a hit, an
+    // obstacle that is genuinely removed still gets no resets and still carves
+    // away to free, which is what `vanishing` checks.
+    //
+    // It is *not* order-independent, which this comment used to claim: it wipes
+    // free evidence that arrived before the return and does nothing about the
+    // reverse. That half is the grace window at the top of this function.
     if (delta > 0) {
         if (n->log_odds < 0) n->log_odds = 0;
         if (shield) n->flags |= OM_FLAG_FRESH_HIT;
