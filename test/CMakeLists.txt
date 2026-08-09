@@ -63,6 +63,7 @@ set(HAWKEYE_FIXTURES
     statue-solo
     statue-fleet
     statue-precision
+    castle-interior
 )
 
 # The statue fixtures range against a Gaussian splat rather than against
@@ -72,6 +73,10 @@ set(STATUE_SPLAT ${CMAKE_SOURCE_DIR}/assets/statue_of_liberty.splat)
 # a map to a finer tolerance than its own 34 cm splat spacing, so the precision
 # fixture ranges against these and scores against them.
 set(STATUE_MESH ${CMAKE_SOURCE_DIR}/assets/statue_of_liberty.tri)
+# A scanned room, for the geometry an exterior orbit of a standing figure
+# cannot produce: enclosed free space, overhangs, and beams that graze one
+# surface on their way to another. Splat only -- see the fixture's comment.
+set(CASTLE_SPLAT ${CMAKE_SOURCE_DIR}/assets/skokloster_castle.splat)
 
 foreach(fixture ${HAWKEYE_FIXTURES})
     set(fixture_scale 1)
@@ -83,6 +88,8 @@ foreach(fixture ${HAWKEYE_FIXTURES})
     if(fixture MATCHES "^statue-")
         set(fixture_splat ${STATUE_SPLAT})
         set(fixture_mesh ${STATUE_MESH})
+    elseif(fixture MATCHES "^castle-")
+        set(fixture_splat ${CASTLE_SPLAT})
     endif()
     add_test(NAME fixture_${fixture}
         COMMAND ${CMAKE_COMMAND}

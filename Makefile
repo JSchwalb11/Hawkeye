@@ -67,6 +67,14 @@ renders: fixtures
 			--gif-interval 1.0 --gif-size 440 620 \
 			--gif-view side --gif-delay 9 >/dev/null; \
 	done
+	@$(BUILD_DIR)/test/ray_injector --fixture castle-interior \
+		--splat assets/skokloster_castle.splat \
+		--tlog $(BUILD_DIR)/test/fixture-runs/castle-interior.tlog \
+		--truth $(BUILD_DIR)/test/fixture-runs/castle-interior.truth >/dev/null
+	@$(BUILD_DIR)/test/map_checker \
+		--truth $(BUILD_DIR)/test/fixture-runs/castle-interior.truth \
+		--tlog $(BUILD_DIR)/test/fixture-runs/castle-interior.tlog \
+		--render docs/assets/fleet-map/castle-interior.png >/dev/null
 	@echo "renders written to docs/assets/fleet-map/"
 
 # Full-resolution PNG frames of the map filling in, and an h264 encode of them.

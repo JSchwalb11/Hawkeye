@@ -59,7 +59,7 @@ typedef enum {
     FX_EMPTY = 0, FX_GROUND, FX_WALL, FX_CORRIDOR, FX_ORIENTATIONS, FX_MOVING,
     FX_TWO_ORIGINS, FX_DISAGREEMENT, FX_VANISHING, FX_CONE, FX_WEAK,
     FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_PRESSURE, FX_COOPERATIVE,
-    FX_STATUE_SOLO, FX_STATUE_FLEET, FX_STATUE_PRECISION, FX_COUNT
+    FX_STATUE_SOLO, FX_STATUE_FLEET, FX_STATUE_PRECISION, FX_CASTLE_INTERIOR, FX_COUNT
 } fixture_id_t;
 
 typedef enum { SENSOR_DISTANCE, SENSOR_OBSTACLE } sensor_kind_t;
@@ -262,6 +262,35 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .shape_voxel_m = 0.05,
     }, 0, 0, 8, true },
 
+    // Inside a room, which is the one thing an exterior orbit of a standing
+    // figure cannot give you.
+    //
+    // The statue fixtures are a convex-ish silhouette observed from outside, and
+    // three separate defects turned out to be invisible to them for that reason:
+    // free cells there almost never have free neighbours on all six sides, no
+    // beam grazes one surface on its way to another, and every sweep happens to
+    // present its misses before its hit. This is the complement -- two drones
+    // flying *within* a scanned hall, 18 x 25 m and 7 m to the vaulting, where
+    // every one of those is the ordinary case rather than a constructed one.
+    //
+    // Splat only, no exact triangles. The source scan is a million faces and
+    // the .tri format stores three vertices per triangle, so the exact
+    // reference would be a 36 MB asset to score a 0.25 m map -- and the
+    // checker's own comment says scoring against the cloud is "fine at
+    // decimetres". At 80,000 splats over 2844 m^2 the spacing is 0.141 m, which
+    // is the floor under the numbers below and sits under the leaf.
+    [FX_CASTLE_INTERIOR] = { "castle-interior", 90.0, 2, 10.0, SENSOR_OBSTACLE, 1, {
+        .surface_rms_max_m = 0.60, .false_occupied_max = 0.30, .false_free_max = 0.10,
+        .coverage_min = 0.85, .occupied_cells_min = 5000, .occupied_cells_max = -1,
+        // Merged completeness only. There is deliberately no solo ceiling here:
+        // one open hall occludes the two drones from nothing, so each of them
+        // does see almost all of it alone (measured 0.992), and asserting
+        // otherwise would be asserting a cooperation claim this fixture is not
+        // built to make. `cooperative` and `statue-fleet` enforce occlusion with
+        // geometry; this one is about the shape of the room.
+        .merged_surface_min = 0.90,
+    }, 0, 0, 4, true },
+
     [FX_ENDURANCE] = { "endurance", 1920.0, 2, 4.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 0.80, .false_occupied_max = 0.20, .false_free_max = 0.10,
         .coverage_min = 0.90, .occupied_cells_min = 1000, .occupied_cells_max = -1,
@@ -430,6 +459,9 @@ static void build_scene(fixture_id_t fx, geom_scene_t *s) {
             add_plane(s, 0, 0, 5, 1, 0, 0, 24, 5, "divider-ns");
             add_plane(s, 0, 0, 5, 0, 1, 0, 24, 5, "divider-ew");
             break;
+
+        case FX_CASTLE_INTERIOR:
+            break;   // the scanned hall is the world; there are no planes
 
         case FX_PRESSURE:
         case FX_ENDURANCE:
@@ -624,6 +656,22 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             p->enu[1] += cy + 7.0 * sin(phase);
             p->enu[2] = 5.0 + 0.4 * sin(t * 0.5);
             p->yaw = phase;
+            break;
+        }
+
+        case FX_CASTLE_INTERIOR: {
+            // Two drones on opposed circuits inside the hall, climbing from
+            // waist height into the vaulting. The floor plan is 18 x 25 m and
+            // the ceiling is at 7.2 m, so these stay well inside the walls and
+            // spend the whole flight looking at surfaces from within.
+            const double phase = t * 0.11 + (double)veh * M_PI;
+            p->enu[0] = 5.5 * cos(phase);
+            p->enu[1] = 8.0 * sin(phase);
+            p->enu[2] = 1.6 + 2.6 * (0.5 - 0.5 * cos(t * 0.05));
+            // Nose along the circuit, so the fan sweeps across the walls at a
+            // shallow angle rather than straight at them -- grazing incidence
+            // is the point of this fixture, not an accident of it.
+            p->yaw = phase + M_PI * 0.5;
             break;
         }
 
@@ -1012,14 +1060,21 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
     // cannot be asked to prove the map has one. A 1.7-degree fan is the same
     // message with a different increment, which is the whole point of
     // increment_f being a float.
-    const bool statue = s->def->splat_world;
+    // `splat_world` is not the same question as "is this the statue". The
+    // castle is also a splat world and wants the opposite sensor: a full circle
+    // at short range, because it is flown from inside the thing it is mapping
+    // rather than orbiting outside it.
+    const bool castle = (s->fx == FX_CASTLE_INTERIOR);
+    const bool statue = s->def->splat_world && !castle;
     const bool precise = (s->fx == FX_STATUE_PRECISION);
     // A 0.09-degree sector is 0.6 cm across at 8 m. That is the whole reason
     // this fixture can be asked about centimetres and the others cannot.
     const float increment = precise ? 0.09f : (statue ? 1.7f : (360.0f / (float)sectors));
     const float angle_offset = precise ? -3.2f : (statue ? -61.0f : 0.0f);
     const uint16_t min_cm = 20;
-    const uint16_t max_cm = precise ? 1600 : (statue ? 9000 : 3000);
+    // The hall's floor diagonal is 30.6 m, so 32 m reaches the far corner from
+    // anywhere inside it without ever being a no-return against open sky.
+    const uint16_t max_cm = precise ? 1600 : (statue ? 9000 : (castle ? 3200 : 3000));
     const double max_m = (double)max_cm * 0.01;
 
     uint16_t distances[OBSTACLE_DISTANCE_SECTORS];
