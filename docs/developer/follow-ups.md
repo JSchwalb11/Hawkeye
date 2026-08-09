@@ -5,8 +5,8 @@ that change; each is written up here with the measurement that motivates it, so
 the next person does not have to rediscover the number before deciding whether
 it is worth the effort.
 
-**Item 1 is done** — see the "Done" section at the end for what it turned out
-to be and what now guards it.
+Finished items move to the "Done" section at the end, with what they turned out
+to be and what now guards them.
 
 Issues are disabled on this repository, which is why these live in the tree
 rather than in a tracker. If issues are turned on, each heading below is a
@@ -16,29 +16,7 @@ Ordered by what I would do first, not by size.
 
 ---
 
-## 1. No regression test behind the `cone_cm` width fix
-
-`tl_ray_t.cone_cm` was a `uint8` in centimetres, saturating at 2.55 m. A 25°
-sonar passes that at 12 m of range. The map sizes the endpoint cell from this
-value, so a reconstruction from the ray log placed a **smaller** occupied cell
-than live did — for exactly the wide-beam sensors where the widening matters
-most. "Live is replay with the playhead pinned to now" quietly stopped being
-true for them.
-
-Widened to `uint16` in `16b3b66`. **No fixture reaches 2.55 m**, so nothing in
-CI would catch it regressing.
-
-What would close it: a fixture with a genuinely wide beam — a 25° sonar at 12 m
-or more — that ranges a known surface, then asserts the live map and a
-scrub-and-replay reconstruction agree on the occupied cell *size*, not just its
-position. That assertion is the one the current suite cannot make, and it is the
-one that fails if the field narrows again.
-
-Small, self-contained, and it protects a fix that is currently on trust.
-
----
-
-## 2. Complete the cone sensor model, or keep the axis carve deliberately
+## 1. Complete the cone sensor model, or keep the axis carve deliberately
 
 Built, measured and **not** shipped in #2. Full reasoning is in
 [`fleet-map.md`](fleet-map.md) under "Why the carve is a ray and not a cone".
@@ -98,7 +76,7 @@ close this.**
 
 ---
 
-## 3. The free-space veil is still hazier than it needs to be
+## 2. The free-space veil is still hazier than it needs to be
 
 After the compositing fix, **72.2%** of surface pixels still read as surface
 against a free-hidden reference frame — up from 34.2%, but not 100%. Two
@@ -117,7 +95,7 @@ nobody re-runs it expecting more.
 *identical across all three compositing variants* — the cost is instance
 submission, not blending, so no compositing change will touch it. Culling free
 cells enclosed on all six faces removed only 28%, because the carved volume is
-lace (see item 2).
+lace (see item 1).
 
 Thinning it further needs a different idea than face-neighbour culling. Two
 worth measuring: greedy meshing of contiguous free runs into larger boxes
@@ -128,7 +106,7 @@ overstate coverage in the one view that exists to show it.
 
 ---
 
-## 4. A TSDF is the right representation for centimetre work
+## 3. A TSDF is the right representation for centimetre work
 
 Not a defect — a structural observation, recorded because it keeps coming up.
 
@@ -159,6 +137,33 @@ repository; none of it is estimated.*
 ---
 
 # Done
+
+## No regression test behind the `cone_cm` width fix
+
+**Closed** by the wide-beam case in `test/test_map_units.c`. A 25° sonar ranges
+a surface 40 m ahead — an **8.87 m** cone radius, three and a half times the old
+2.55 m ceiling — the map is built live, scrubbed back before the ray, then
+played forward over it so the reconstruction comes out of the ray log. It
+asserts the occupied cell at the surface is the same *size* both times, which is
+the assertion the scored fixtures cannot make. Mutation-tested: with `cone_cm`
+back to a `uint8`, live places an **8.00 m** cell and the reconstruction a
+**4.00 m** one, and the case fails.
+
+It is a unit test rather than a fixture because a fixture scores a finished map
+against known geometry and never compares live against a reconstruction; the
+comparison, not the scene, is the whole content of this one.
+
+**The width is only observable at some resolutions, which is worth knowing
+before trusting the fix.** `octomap_insert_ray` floors `hit_depth` at
+`coarse_depth`, so the endpoint cell is never coarser than the far-field carve
+cell. At the viewer's default 0.25 m leaves that cell is 2 m, and an 8.87 m cone
+and a truncated 2.55 m one both measure **2.00 m** — identical, bug or no bug.
+The divergence needs a carve cell coarser than 5.1 m, which under the fixed
+4096 m root means leaves of 1 m or coarser (`--map-res 1.0` and up), and that is
+what the test configures. The scored fixtures all run at 2 m carve cells, which
+is a second reason none of them could ever have caught this.
+
+---
 
 ## Pruning walked the whole tree on every drain once the byte cap was reached
 
