@@ -388,7 +388,10 @@ int main(int argc, char *argv[]) {
     // Init Raylib
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(win_w, win_h, "Hawkeye");
-    SetTargetFPS(60);
+    // MEASUREMENT-ONLY: uncap the frame rate so the renderer's true cost is
+    // observable. With the 60 fps cap every configuration reports exactly
+    // 16.67 ms and the headroom is invisible. Drop this commit before merging.
+    SetTargetFPS(getenv("HAWKEYE_UNCAP") != NULL ? 0 : 60);
 
     // Init data sources
     bool is_replay = (num_replay_files > 0);
@@ -1574,6 +1577,28 @@ int main(int argc, char *argv[]) {
 
         // Update debug panel
         debug_panel_update(&dbg_panel, GetFrameTime());
+
+        // MEASUREMENT-ONLY: one CSV row per frame on stdout so frame time can
+        // be analysed as a distribution offline (the HUD only shows an
+        // instantaneous value, and the mean hides the extraction backlog).
+        // Gated on an env var so it costs nothing when unset. Drop this commit
+        // before merging.
+        if (getenv("HAWKEYE_FRAME_CSV") != NULL) {
+            static bool csv_header_done = false;
+            if (!csv_header_done) {
+                printf("#frame_ms,fps,instances,draw_calls,extract_ms,"
+                       "chunks_drawn,chunks_live\n");
+                csv_header_done = true;
+            }
+            printf("%.4f,%d,%u,%u,%.4f,%u,%u\n",
+                   GetFrameTime() * 1000.0f, GetFPS(),
+                   map_render_ready ? map_render.stats.instances_drawn : 0u,
+                   map_render_ready ? map_render.stats.draw_calls : 0u,
+                   map_render_ready ? map_render.stats.extract_ms : 0.0f,
+                   map_render_ready ? map_render.stats.chunks_drawn : 0u,
+                   map_render_ready ? map_render.stats.chunks_live : 0u);
+            fflush(stdout);
+        }
 
         // Update camera to follow selected vehicle
         {
