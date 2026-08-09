@@ -332,10 +332,48 @@ static struct iovec       batch_iov[RECV_BATCH];
 static struct sockaddr_in batch_addr[RECV_BATCH];
 #endif
 
-void mavlink_receiver_poll(mavlink_receiver_t *recv) {
-    bool got_data = false;
+// Drain the socket one datagram per syscall. This is the portable path, and on
+// Linux it is also the fallback when recvmmsg turns out not to be usable.
+static bool drain_single(mavlink_receiver_t *recv) {
+    bool got = false;
+    uint8_t buf[2048];
+    struct sockaddr_in sender;
+
+    for (;;) {
+        // Reset per call: recvfrom writes the actual address length back, so a
+        // shared variable would hand the next call whatever the last one left.
+        socklen_t sender_len = sizeof(sender);
+        int n = recvfrom(recv->sockfd, (char *)buf, sizeof(buf), 0,
+                         (struct sockaddr *)&sender, &sender_len);
+        if (n <= 0) break;
+
+        got = true;
+
+        if (!recv->sender_known) {
+            memcpy(recv->sender_addr, &sender, sizeof(struct sockaddr_in));
+            recv->sender_known = true;
+        }
+
+        parse_datagram(recv, buf, n);
+    }
+    return got;
+}
 
 #ifdef __linux__
+// recvmmsg is a Linux syscall, and being on Linux is not enough to have it: it
+// returns ENOSYS under qemu-user and older WSL1, and EPERM under a seccomp
+// profile that allowlists recvfrom but not recvmmsg. The first version of this
+// treated every non-positive return as "queue empty", which in those
+// environments means the viewer connects, shows a live link, and displays no
+// telemetry at all, forever, with nothing on stderr. A syscall saved is not
+// worth that, so a hard failure stands the batch path down for the rest of the
+// process and drain_single takes over -- including for the datagrams still
+// queued in this same poll.
+static bool batch_available = true;
+
+static bool drain_batched(mavlink_receiver_t *recv) {
+    bool got = false;
+
     for (;;) {
         for (int i = 0; i < RECV_BATCH; i++) {
             batch_iov[i].iov_base = batch_buf[i];
@@ -351,10 +389,19 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
 
         // The socket stays non-blocking, so this hands back whatever is queued
         // right now and -1/EAGAIN once the queue is empty.
-        int count = recvmmsg(recv->sockfd, batch_msgs, RECV_BATCH, 0, NULL);
-        if (count <= 0) break;
+        const int count = recvmmsg(recv->sockfd, batch_msgs, RECV_BATCH, 0, NULL);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;   // drained
+            fprintf(stderr,
+                    "mavlink: recvmmsg unusable (%s); falling back to one "
+                    "datagram per syscall\n", strerror(errno));
+            batch_available = false;
+            break;
+        }
+        if (count == 0) break;
 
-        got_data = true;
+        got = true;
 
         if (!recv->sender_known) {
             memcpy(recv->sender_addr, &batch_addr[0], sizeof(struct sockaddr_in));
@@ -368,26 +415,21 @@ void mavlink_receiver_poll(mavlink_receiver_t *recv) {
         // that could only return EAGAIN.
         if (count < RECV_BATCH) break;
     }
+    return got;
+}
+#endif
+
+void mavlink_receiver_poll(mavlink_receiver_t *recv) {
+    bool got_data = false;
+
+#ifdef __linux__
+    if (batch_available) got_data = drain_batched(recv);
+    // Not an else: a batch path that just stood itself down leaves whatever was
+    // queued behind it, and that is exactly the poll where dropping it would
+    // look like a dead link.
+    if (!batch_available) got_data = drain_single(recv) || got_data;
 #else
-    // Portable fallback (Windows, macOS): recvmmsg() is Linux-only.
-    uint8_t buf[2048];
-    struct sockaddr_in sender;
-    socklen_t sender_len = sizeof(sender);
-
-    for (;;) {
-        int n = recvfrom(recv->sockfd, (char *)buf, sizeof(buf), 0,
-                         (struct sockaddr *)&sender, &sender_len);
-        if (n <= 0) break;
-
-        got_data = true;
-
-        if (!recv->sender_known) {
-            memcpy(recv->sender_addr, &sender, sizeof(struct sockaddr_in));
-            recv->sender_known = true;
-        }
-
-        parse_datagram(recv, buf, n);
-    }
+    got_data = drain_single(recv);
 #endif
 
     if (got_data) {

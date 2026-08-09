@@ -1645,7 +1645,7 @@ int main(int argc, char *argv[]) {
                     map_render_draw(&map_render, &map_session, scene.camera, scene.theme);
                 if (map_ready)
                     quality_overlay_draw_3d(&map_session, &quality_opts, selected, scene.theme);
-                if (vehicle_count > 60) {
+                if (vehicle_count > VEHICLE_MARKER_LIMIT) {
                     draw_density_heatmap(vehicles, vehicle_count, scene.theme);
                     // rlgl has no RL_POINTS primitive; DrawPoint3D is raylib's
                     // point, batched into the same RL_LINES draw call.
@@ -1747,11 +1747,11 @@ int main(int argc, char *argv[]) {
             EndMode3D();
 
             // Colour repeats after the finite palette; the runtime index never does.
-            if (vehicle_count > 16) {
+            if (vehicle_count > VEHICLE_FULL_MODEL_LIMIT) {
                 Vector3 label_cam_fwd = Vector3Normalize(Vector3Subtract(
                     scene.camera.target, scene.camera.position));
                 for (int i = 0; i < vehicle_count; i++) {
-                    if (vehicle_count > 60 && i != selected) continue;
+                    if (vehicle_count > VEHICLE_MARKER_LIMIT && i != selected) continue;
                     if (!vehicles[i].active) continue;
                     // GetWorldToScreen mirrors points behind the camera onto
                     // the viewport; skip them rather than draw phantom labels.

@@ -1441,6 +1441,19 @@ void vehicle_draw_sphere(Vector3 center, float radius, Color color) {
         shared_sphere = LoadModelFromMesh(GenMeshSphere(1.0f, 16, 16));
         shared_sphere_ready = true;
     }
+    // Not a drop-in swap without this. DrawSphereEx feeds the rlgl batch, which
+    // is flushed in submission order at EndMode3D; DrawModelEx goes through
+    // DrawMesh, which issues its own draw call immediately and never touches
+    // that batch. Markers are translucent (alpha 240/210) and trails and
+    // drop-lines are drawn around them, so without a flush here the queued
+    // geometry lands *after* the sphere regardless of the order it was
+    // submitted in: trails in front blend over the marker instead of occluding
+    // it, trails behind get depth-rejected instead of showing through.
+    //
+    // Flushing costs a draw call per marker and still leaves the win intact --
+    // what this commit set out to remove was 1,536 CPU-side vertices and their
+    // sinf/cosf pairs per sphere per frame, not the draw call.
+    rlDrawRenderBatchActive();
     DrawModelEx(shared_sphere, center, (Vector3){0.0f, 1.0f, 0.0f}, 0.0f,
                 (Vector3){radius, radius, radius}, color);
 }
