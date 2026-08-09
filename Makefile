@@ -13,7 +13,7 @@ else
     EXE  := $(BUILD_DIR)/hawkeye
 endif
 
-.PHONY: build configure test clean release run test-core sanitize fixtures renders
+.PHONY: build configure test clean release run test-core sanitize fixtures renders videos
 
 build: configure
 	cmake --build $(BUILD_DIR) --config $(BUILD_TYPE) -j$(JOBS)
@@ -68,6 +68,24 @@ renders: fixtures
 			--gif-view side --gif-delay 9 >/dev/null; \
 	done
 	@echo "renders written to docs/assets/fleet-map/"
+
+# Full-resolution PNG frames of the map filling in, and an h264 encode of them.
+# Kept out of `renders` because it needs ffmpeg, which the fixtures do not.
+FFMPEG ?= ffmpeg
+videos: fixtures
+	@mkdir -p docs/assets/fleet-map
+	@for f in statue-solo statue-fleet; do \
+		rm -rf $(BUILD_DIR)/frames-$$f && mkdir -p $(BUILD_DIR)/frames-$$f; \
+		$(BUILD_DIR)/test/map_checker \
+			--truth $(BUILD_DIR)/test/fixture-runs/$$f.truth \
+			--tlog $(BUILD_DIR)/test/fixture-runs/$$f.tlog \
+			--frames $(BUILD_DIR)/frames-$$f \
+			--gif-interval 0.2 --gif-size 720 1000 --gif-view side >/dev/null; \
+		$(FFMPEG) -y -framerate 24 -i $(BUILD_DIR)/frames-$$f/frame-%05d.png \
+			-c:v libx264 -preset slow -crf 20 -pix_fmt yuv420p \
+			-movflags +faststart docs/assets/fleet-map/$$f-mapping.mp4; \
+	done
+	@echo "videos written to docs/assets/fleet-map/"
 
 # Address + undefined behavior sanitizers
 sanitize:

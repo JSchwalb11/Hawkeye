@@ -107,15 +107,28 @@ nothing but `OBSTACLE_DISTANCE` messages:
 
 ![statue-fleet mapping](../assets/fleet-map/statue-fleet-mapping.gif)
 
-Rendered straight from the octree at one-second intervals during replay, so it
-needs no GPU and no window and is reproducible in CI. `make renders` writes it,
-or by hand:
+Also as h264, at full resolution and 24 fps:
+[`statue-fleet-mapping.mp4`](../assets/fleet-map/statue-fleet-mapping.mp4) and
+[`statue-solo-mapping.mp4`](../assets/fleet-map/statue-solo-mapping.mp4).
+
+Both are rendered straight from the octree at intervals during replay, so they
+need no GPU and no window and are reproducible in CI. `make renders` writes the
+GIFs; `make videos` writes full-resolution PNG frames and encodes them, kept
+separate because it is the only thing here that needs ffmpeg. By hand:
 
 ```
 map_checker --tlog statue-fleet.tlog --truth statue-fleet.truth \
     --gif statue-fleet-mapping.gif --gif-interval 1.0 \
     --gif-size 440 620 --gif-view side
+
+map_checker --tlog statue-fleet.tlog --truth statue-fleet.truth \
+    --frames frames/ --gif-interval 0.2 --gif-size 720 1000 --gif-view side
+ffmpeg -framerate 24 -i frames/frame-%05d.png -c:v libx264 \
+    -crf 20 -pix_fmt yuv420p statue-fleet-mapping.mp4
 ```
+
+The video encodes the PNG frames rather than the GIF, so it is not a re-encode
+of a 256-entry palette.
 
 The framing comes from the truth rays' *hit* endpoints, computed before the
 first frame. Fitting to the map instead would frame whatever the first second

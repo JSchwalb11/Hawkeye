@@ -252,6 +252,7 @@ static uint64_t count_drop_events(const timeline_t *tl) {
 // CI.
 typedef struct {
     gif_writer_t *gif;
+    const char   *frames_dir;   // optional PNG sequence, for video encoding
     canvas_t      canvas;
     double        interval_s;
     double        next_s;
@@ -263,7 +264,7 @@ typedef struct {
 
 static void progress_frame(progress_gif_t *g, const octomap_t *map,
                            const truth_t *t, double t_s) {
-    if (!g->gif) return;
+    if (!g->gif && !g->frames_dir) return;
 
     // Framing comes from the truth rays, computed once before the first frame.
     // Fitting to the map instead would frame whatever the first second of
@@ -305,7 +306,14 @@ static void progress_frame(progress_gif_t *g, const octomap_t *map,
 
     ortho_draw_panel(&g->canvas, 0, 0, g->canvas.w, g->canvas.h,
                      map, g->view, ORTHO_OCCUPANCY, &o, "OCCUPANCY");
-    gif_add_frame(g->gif, g->canvas.px);
+    if (g->gif) gif_add_frame(g->gif, g->canvas.px);
+    if (g->frames_dir) {
+        // Full-colour frames as well, so a video is encoded from the render
+        // rather than from the GIF's 256-entry palette.
+        char path[600];
+        snprintf(path, sizeof(path), "%s/frame-%05d.png", g->frames_dir, g->frames);
+        canvas_write_png(&g->canvas, path);
+    }
     g->frames++;
 }
 
@@ -337,7 +345,7 @@ static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *
             map_ingest_drain(&ms->ingest, &ms->map, 1.0f / 60.0f);
             next_drain += FRAME_NS;
         }
-        if (pg && pg->gif) {
+        if (pg && (pg->gif || pg->frames_dir)) {
             const double t_s = (double)(arrival - first_ns) * 1e-9;
             if (t_s >= pg->next_s) {
                 // Drain first, so a frame shows the map as of this instant
@@ -1164,6 +1172,7 @@ static void usage(void) {
     printf("            [--listen <port> [--spawn <injector> --fixture <name>] --seconds <s>]\n");
     printf("            [--gif <out.gif> [--gif-interval <s>] [--gif-size <w> <h>]\n");
     printf("             [--gif-view top|side|front] [--gif-delay <centiseconds>]]\n");
+    printf("            [--frames <dir>]   PNG sequence, for encoding a video\n");
 }
 
 int main(int argc, char **argv) {
@@ -1176,6 +1185,7 @@ int main(int argc, char **argv) {
     int focus = 0;
     double seconds = 30.0;
     const char *gif_path = NULL;
+    const char *frames_dir = NULL;
     double gif_interval = 1.0;
     int gif_w = 560, gif_h = 720, gif_frame_cs = 12;
     ortho_view_t gif_view = ORTHO_SIDE;
@@ -1190,6 +1200,7 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--render") == 0 && i + 1 < argc) render_path = argv[++i];
         else if (strcmp(argv[i], "--focus") == 0 && i + 1 < argc) focus = atoi(argv[++i]);
         else if (strcmp(argv[i], "--gif") == 0 && i + 1 < argc) gif_path = argv[++i];
+        else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames_dir = argv[++i];
         else if (strcmp(argv[i], "--gif-interval") == 0 && i + 1 < argc) gif_interval = atof(argv[++i]);
         else if (strcmp(argv[i], "--gif-size") == 0 && i + 2 < argc) {
             gif_w = atoi(argv[++i]); gif_h = atoi(argv[++i]);
@@ -1257,18 +1268,21 @@ int main(int argc, char **argv) {
     memset(&rep, 0, sizeof(rep));
     progress_gif_t pg;
     memset(&pg, 0, sizeof(pg));
-    if (gif_path) {
+    if (gif_path || frames_dir) {
+        pg.frames_dir = frames_dir;
         pg.interval_s = gif_interval > 0.0 ? gif_interval : 1.0;
         pg.view = gif_view;
         if (canvas_init(&pg.canvas, gif_w, gif_h, 0x0d1117) != 0) {
             fprintf(stderr, "cannot allocate the %dx%d gif canvas\n", gif_w, gif_h);
             return 1;
         }
-        int delay_cs = (int)(gif_frame_cs > 0 ? gif_frame_cs : 12);
-        pg.gif = gif_open(gif_path, gif_w, gif_h, delay_cs, true);
-        if (!pg.gif) {
-            fprintf(stderr, "cannot write %s\n", gif_path);
-            return 1;
+        if (gif_path) {
+            int delay_cs = (int)(gif_frame_cs > 0 ? gif_frame_cs : 12);
+            pg.gif = gif_open(gif_path, gif_w, gif_h, delay_cs, true);
+            if (!pg.gif) {
+                fprintf(stderr, "cannot write %s\n", gif_path);
+                return 1;
+            }
         }
     }
 
@@ -1279,14 +1293,14 @@ int main(int argc, char **argv) {
         truth_free(&truth);
         return 1;
     }
-    if (pg.gif) {
+    if (pg.gif || pg.frames_dir) {
         // A few frames of the finished map, so the loop does not snap back to
         // an empty octree the instant it completes.
         for (int i = 0; i < 8; i++) progress_frame(&pg, &ms.map, &truth, truth.header.duration_s);
-        const uint32_t n = gif_frame_count(pg.gif);
-        gif_close(pg.gif);
+        const int n = pg.frames;
+        if (pg.gif) { gif_close(pg.gif); printf("  wrote %s (%d frames)\n", gif_path, n); }
+        if (pg.frames_dir) printf("  wrote %d frames to %s\n", n, pg.frames_dir);
         canvas_free(&pg.canvas);
-        printf("  wrote %s (%u frames)\n", gif_path, n);
     }
 
     measure(&ms, &truth, &world, &rep);
