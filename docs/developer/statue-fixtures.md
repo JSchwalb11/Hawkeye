@@ -88,17 +88,25 @@ the precision section below for why that distinction has teeth.
 
 | | solo | fleet |
 | --- | --- | --- |
-| surface RMS | 0.176 m | 0.135 m |
-| false-occupied | 0.023 | 0.013 |
-| shape recall | 0.976 | 0.989 |
-| shape precision (strict / ±1 voxel) | 0.552 / 0.999 | 0.554 / 0.999 |
-| whole-cloud coverage | 0.855 | 0.879 |
-| merged surface | — | 0.988 |
-| best single drone alone | — | 0.365 |
+| surface RMS | 0.243 m | 0.177 m |
+| false-occupied | 0.049 | 0.025 |
+| false-free | 0.0005 | 0.0006 |
+| shape recall | 0.9996 | 1.0000 |
+| shape precision (strict / ±1 voxel) | 0.526 / 0.995 | 0.531 / 0.996 |
+| whole-cloud coverage | 0.881 | 0.897 |
+| merged surface | — | 0.9994 |
+| best single drone alone | — | 0.371 |
 
 The fleet reaches more of the statue in half the time, and no single drone
-accounts for more than 37% of the observed surface. That is the cooperative
+accounts for more than 38% of the observed surface. That is the cooperative
 claim on a real object rather than on a box.
+
+RMS and false-occupied are both about twice what they were before the erosion
+fix below, and that is the trade it makes: the map now keeps the marginal cells
+that carving used to erase, and some of them sit a leaf further out. At 0.25 m
+leaves an RMS of 0.243 m is one leaf, ±1-voxel precision is unchanged at 0.995,
+and recall goes from 0.976 to 1.000 — the extra cells are on the statue's
+edges, not scattered.
 
 ## Watching it happen
 
@@ -175,43 +183,67 @@ were sampled from, and scores against them too. `tools/bake_splat.py --tri`
 writes them; `test/trimesh.c` does Möller–Trumbore and exact point-triangle
 distance.
 
-**Result: surface RMS 0.0008 m, max error 0.0052 m, false-occupied 0.00000.**
-Eight tenths of a millimetre, against an exact reference.
+**Result: surface RMS 0.0009 m, max error 0.0066 m, false-occupied 0.00000,
+false-free 0.0005.** Nine tenths of a millimetre, against an exact reference,
+with 99.95% of observed surface represented.
 
-### What it does not achieve, and why
+### The erosion bug this fixture found
 
-Completeness is a separate question and comes out worse: about a third of
-observed surface points have no occupied cell within 2 cm. The cause was
-measured rather than asserted, because the obvious explanation turned out to be
-only half right.
+Accuracy was never the hard part. Completeness was: at first run, **a third of
+all observed surface points had no occupied cell within 2 cm**, while surface
+RMS was 0.9 mm and false-occupied was 0.00000. That combination is diagnostic
+on its own — a map that puts cells in exactly the right place, and then loses
+them.
+
+Three plausible fixes were measured, and all three did nothing:
 
 | change | false-free |
 | --- | --- |
 | baseline | 0.317 |
 | hold a cell at the occupancy threshold once it reaches it | 0.316 |
-| stop each ray's carve 2 cm short of its own endpoint | 0.316 |
-| ...5 cm short | 0.314 |
-| **a cell that has *ever* been hit is immune to free evidence** | **0.185** |
+| a cell that has *ever* been hit is immune to free evidence | 0.316 |
+| a hit banks credits that later misses spend instead of applying | 0.316 |
+| stop each ray's carve 2 / 5 / 10 cm short of its own endpoint | 0.315 / 0.314 / 0.313 |
+| **clear stale free evidence when a range return arrives** | **0.0005** |
 
-The first three do nothing. The last halves the gap, and the difference between
-it and the first is **ordering**: misses arrive in bulk and often *before* the
-hit, so the cell is already buried by the time it is first marked, and no
-protect-what-is-currently-occupied rule can see it. With hit `+15` and miss
-`-8` against a `±70` clamp, a handful of grazing rays is enough.
+Instrumenting the failing region explained why. Every hit there was landing on
+precisely the right 7.8 mm leaf — the reconstructed endpoints sit within 5 mm
+of the injector's own, which is the 1 cm wire quantisation and nothing else —
+and every one of them came out of `node_apply` at `-53`. The leaf was already
+pinned at the `-70` clamp before its first hit ever arrived, and a single `+17`
+return cannot climb out of that.
 
-The fix is not that sticky flag. A cell that can never be cleared is a map that
-cannot notice an obstacle being removed, which is exactly what `vanishing`
-exists to catch. What is wanted is a **truncation band around observed
-surface** — free evidence suppressed within a few centimetres of where rays
-have been terminating, with the band moving as the evidence moves. That is what
-a TSDF gives for free: a ray passing near a surface writes a positive signed
-distance rather than "empty", so the zero crossing survives a grazing pass and
-still moves when the surface genuinely goes away. A 5 cm TSDF also resolves a
-surface to roughly voxel/10, at 1/125 the cell count of a 1 cm binary grid.
+The misses doing the damage come from rays that never passed through empty
+space at all. At 7.8 mm a leaf is routinely *partially* occupied, and a ray at
+grazing incidence skims such a leaf for a long way before terminating somewhere
+further along; the carve then debits every leaf it clipped. That evidence is
+systematically wrong, it is bulky, and it arrives first. Every fix in the first
+four rows is a rule about cells that are *already* occupied, so all four arrive
+too late to matter — which is why suppressing misses, in three different
+flavours, moves the number by 0.001.
 
-Not part of this change.
+Clearing on the hit is order-independent and needs no extra state: a range
+return zeroes any accumulated free evidence before its own is applied. It says
+a present-tense measurement of a surface outranks any amount of inference drawn
+from rays that merely passed nearby. Because it fires only on a hit, an
+obstacle that is genuinely removed gets no resets and still carves away to
+free — `vanishing` still reports zero cells on removed geometry.
 
-Two other limits are worth stating because a fixture cannot supply them:
+The same change lifts the decimetre fixtures: `statue-solo` goes from 0.0219
+false-free to 0.0005 and `statue-fleet` from 0.0123 to 0.0006, shape recall
+reaches 1.00000, and the merged-versus-solo split is unchanged — 0.9994 merged
+against 0.371 for the best single drone, so completeness did not come from
+quietly making every drone see everything. On the twelve plane fixtures nothing
+regresses; `disagreement`, which flies a deliberate localisation offset, gets
+markedly better (surface RMS 1.245 → 1.054 m, false-free 0.409 → 0.128).
+
+A TSDF would have prevented this class of bug outright — a ray passing near a
+surface writes a positive signed distance rather than "empty", so a zero
+crossing survives a grazing pass — and it resolves a surface to roughly
+voxel/10 at 1/125 the cell count of a 1 cm binary grid. That remains the right
+representation for centimetre work and is not part of this change.
+
+Two limits are worth stating because a fixture cannot supply them:
 
 - **Pose.** The injector's poses are exact. A real flight's are not, and at
   this tolerance they are the entire budget: 0.5 deg of attitude error over a

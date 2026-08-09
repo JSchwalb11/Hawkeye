@@ -358,6 +358,33 @@ static void node_apply(octomap_t *m, uint32_t idx, int delta, uint8_t vehicle_id
         if (n->agree == 255 && n->disagree == 255) { n->agree = 128; n->disagree = 128; }
     }
 
+    // A range return wipes accumulated free evidence before it is applied.
+    //
+    // Free evidence and occupied evidence are not equally trustworthy, and the
+    // difference shows up as soon as the leaf is small enough to be *partially*
+    // occupied. A ray at grazing incidence skims a surface for a long way before
+    // it terminates, and every leaf it clips takes a full miss even though the
+    // beam never passed through empty space there. Those misses are systematic
+    // and they arrive in bulk, so by the time a ray finally does terminate in
+    // one of those leaves the cell is already pinned at the negative clamp --
+    // and a single +17 return leaves it at -53, still free.
+    //
+    // Measured on statue-precision, where 7.8 mm leaves make this the dominant
+    // effect: every hit in the failing region landed at exactly the right leaf
+    // and came out at -53, and a third of all observed surface was reported
+    // free. Suppressing the misses does not help, because they are not the
+    // cause -- the ordering is. Protecting cells that are already occupied
+    // moves the rate by 0.001; making a cell immune to free evidence once it
+    // has ever been hit moves it by 0.002; stopping each ray's own carve 10 cm
+    // short of its endpoint moves it by 0.003. All three arrive too late.
+    //
+    // Clearing on the hit is order-independent and costs no state. It says a
+    // present-tense range return is authoritative about a cell over any amount
+    // of inference drawn from rays that merely passed nearby -- and, because it
+    // fires only on a hit, an obstacle that is genuinely removed still gets no
+    // resets and still carves away to free, which is what `vanishing` checks.
+    if (delta > 0 && n->log_odds < 0) n->log_odds = 0;
+
     int lo = (int)n->log_odds + delta;
     if (lo >  OM_LO_CLAMP) lo =  OM_LO_CLAMP;
     if (lo < -OM_LO_CLAMP) lo = -OM_LO_CLAMP;

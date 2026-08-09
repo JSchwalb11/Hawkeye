@@ -195,9 +195,9 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     // Solo: one drone flies a full orbit and climbs, so it can see the whole
     // statue given time. Its map is expected to resemble the statue outright.
     [FX_STATUE_SOLO] = { "statue-solo", 120.0, 1, 10.0, SENSOR_OBSTACLE, 1, {
-        .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.15,
+        .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.02,
         .coverage_min = 0.80, .occupied_cells_min = 3000, .occupied_cells_max = -1,
-        .shape_iou_min = 0.40, .shape_recall_min = 0.90,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.95,
         .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
     }, 0, 0, 2, true },
 
@@ -206,9 +206,9 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     // back. The merged map must resemble the statue and no single drone's
     // contribution may.
     [FX_STATUE_FLEET] = { "statue-fleet", 60.0, 4, 10.0, SENSOR_OBSTACLE, 1, {
-        .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.15,
+        .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.02,
         .coverage_min = 0.80, .occupied_cells_min = 4000, .occupied_cells_max = -1,
-        .shape_iou_min = 0.40, .shape_recall_min = 0.90,
+        .shape_iou_min = 0.40, .shape_recall_min = 0.95,
         .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
         .merged_surface_min = 0.95, .solo_surface_max = 0.60,
     }, 0, 0, 4, true },
@@ -231,30 +231,23 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         // than at the figure that happens to come out, and it is an order of
         // magnitude below anything the decimetre fixtures can claim.
         .surface_rms_max_m = 0.01, .false_occupied_max = 0.05,
-        // The tolerance here is a single 7.8 mm leaf, a far tighter question
-        // than the same rate asks of a 0.25 m map. Cells sitting two leaves
-        // away still score 0.9 mm RMS and zero false-occupied, so this rate is
-        // measuring quantisation rather than loss.
-        // What this fixture asserts is *accuracy*: where the map puts a cell,
-        // that cell is 0.9 mm from the true surface and never off it.
+        // Completeness at the same scale. The tolerance is 2 cm stated in
+        // metres rather than in leaves, because a rate expressed in leaves asks
+        // a 7.8 mm map a hundred times harder a question than a 0.25 m one and
+        // the two stop being comparable.
         //
-        // Completeness is a separate question and comes out worse -- about a
-        // third of observed surface points have no cell within 2 cm. That is
-        // erosion, and it was measured rather than assumed: holding a cell at
-        // or above the occupancy threshold once it gets there changes the rate
-        // by 0.001, and a 2-5 cm truncation band on each ray's own endpoint
-        // changes it by 0.002, but making a cell that has *ever* been hit
-        // immune to free evidence takes it from 0.317 to 0.185. The order is
-        // what matters: misses arrive in bulk and often before the hit, so the
-        // cell is buried before it was ever occupied and no
-        // protect-what-is-occupied rule can see it.
-        //
-        // The fix is not a sticky flag -- that would stop the map ever clearing
-        // a removed obstacle, which `vanishing` exists to catch. It is a
-        // truncation band around observed surface, which is what a TSDF gives
-        // for free and which clears properly because the band moves with the
-        // evidence. Not part of this change.
-        .false_free_max = 0.40, .surface_tol_m = 0.02,
+        // This is the number that found the erosion bug. It sat at 0.317 -- a
+        // third of all observed surface reported free -- while surface RMS was
+        // 0.9 mm and false-occupied was zero, which is the signature of a map
+        // that puts cells in exactly the right place and then loses them. Every
+        // hit in the failing region was landing on precisely the right 7.8 mm
+        // leaf and coming out at -53: the leaf had already been carved to the
+        // negative clamp by rays that merely skimmed past it, and one +17
+        // return could not climb out. Suppressing those misses did not help
+        // (0.001 to 0.003 across three different schemes) because they are not
+        // the cause; the ordering is. Clearing stale free evidence when a range
+        // return arrives takes it to 0.0005. See `node_apply`.
+        .false_free_max = 0.02, .surface_tol_m = 0.02,
         .coverage_min = 0.90, .occupied_cells_min = 5000, .occupied_cells_max = -1,
         .shape_voxel_m = 0.05,
     }, 0, 0, 8, true },
