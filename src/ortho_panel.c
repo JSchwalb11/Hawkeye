@@ -257,11 +257,24 @@ void ortho_panel_render(ortho_panel_t *op, const vehicle_t *vehicles,
         BeginTextureMode(op->targets[v]);
             ClearBackground(bg_col);
             BeginMode3D(op->cameras[v]);
-                // Draw vehicle models only (trail_mode=0, no trails in 3D)
+                // Draw vehicle models only (trail_mode=0, no trails in 3D).
+                //
+                // Tiered exactly as the main 3D pass tiers in main.c: full
+                // models up to VEHICLE_FULL_MODEL_LIMIT (and always for the
+                // selected vehicle), simplified markers up to
+                // VEHICLE_MARKER_LIMIT, nothing beyond. Ungated, this loop
+                // drew every vehicle at full detail into all three targets —
+                // at 25 vehicles that is 75 full-model draws per frame
+                // against the main pass's one, so the summary views cost
+                // more than the world they summarise.
                 for (int i = 0; i < vehicle_count; i++) {
-                    if (vehicles[i].active || vehicle_count == 1) {
+                    if (!(vehicles[i].active || vehicle_count == 1)) continue;
+                    if (vehicle_count <= VEHICLE_FULL_MODEL_LIMIT || i == selected) {
                         vehicle_draw((vehicle_t *)&vehicles[i], theme, i == selected,
                                      0, false, op->cameras[v].position, false);
+                    } else if (vehicle_count <= VEHICLE_MARKER_LIMIT) {
+                        vehicle_draw_sphere(vehicles[i].position, 0.18f,
+                                            vehicles[i].color);
                     }
                 }
 

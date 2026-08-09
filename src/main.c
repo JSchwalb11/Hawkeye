@@ -1278,7 +1278,7 @@ int main(int argc, char *argv[]) {
                 int hit = -1;
                 for (int i = 0; i < vehicle_count; i++) {
                     if (!vehicles[i].active) continue;
-                    float radius = (i == selected || vehicle_count <= 16)
+                    float radius = (i == selected || vehicle_count <= VEHICLE_FULL_MODEL_LIMIT)
                                      ? vehicles[i].model_scale : 0.35f;
                     RayCollision collision = GetRayCollisionSphere(
                         ray, vehicles[i].position, fmaxf(radius, 0.25f));
@@ -1656,12 +1656,12 @@ int main(int argc, char *argv[]) {
                 }
                 for (int i = 0; i < vehicle_count; i++) {
                     if (vehicles[i].active || vehicle_count == 1) {
-                        if (vehicle_count <= 16 || i == selected) {
+                        if (vehicle_count <= VEHICLE_FULL_MODEL_LIMIT || i == selected) {
                             vehicle_draw(&vehicles[i], scene.theme, i == selected,
-                                         (i == selected || vehicle_count <= 16) ? tm_3d : 0,
+                                         (i == selected || vehicle_count <= VEHICLE_FULL_MODEL_LIMIT) ? tm_3d : 0,
                                          show_ground_track, scene.camera.position,
                                          classic_colors);
-                        } else if (vehicle_count <= 60) {
+                        } else if (vehicle_count <= VEHICLE_MARKER_LIMIT) {
                             vehicle_draw_sphere(vehicles[i].position, 0.18f, vehicles[i].color);
                         }
                     }
@@ -1907,7 +1907,7 @@ int main(int argc, char *argv[]) {
             // detail is not, so the panel collapses to one line above 16.
             if (map_ready) {
                 const int sw2 = GetScreenWidth(), sh2 = GetScreenHeight();
-                if (show_map_panel && vehicle_count <= 16) {
+                if (show_map_panel && vehicle_count <= VEHICLE_FULL_MODEL_LIMIT) {
                     const int pw = 232;
                     int py = 96;
                     py += map_hud_draw_panel(&map_session, &map_render, sw2 - pw - 12, py,

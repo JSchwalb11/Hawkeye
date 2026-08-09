@@ -55,6 +55,16 @@ extern const vehicle_model_info_t vehicle_models[];
 extern const int vehicle_model_count;
 
 // Default model indices (match vehicle_models[] order in vehicle.c)
+/* Level-of-detail thresholds, shared by every pass that draws vehicles.
+ *
+ * Named here rather than repeated as literals because the two passes drifting
+ * apart *was* a bug: the main 3D pass gated at 16 while the orthographic
+ * panel drew every vehicle at full detail into three render targets, so a
+ * 25-vehicle fleet cost 75 full-model draws per frame in the summary views
+ * against one in the world view. */
+#define VEHICLE_FULL_MODEL_LIMIT 16
+#define VEHICLE_MARKER_LIMIT     60
+
 #define MODEL_QUADROTOR   0
 #define MODEL_FIXEDWING   1
 #define MODEL_TAILSITTER  2
