@@ -257,11 +257,40 @@ void ortho_panel_render(ortho_panel_t *op, const vehicle_t *vehicles,
         BeginTextureMode(op->targets[v]);
             ClearBackground(bg_col);
             BeginMode3D(op->cameras[v]);
-                // Draw vehicle models only (trail_mode=0, no trails in 3D)
+                // Draw vehicle models only (trail_mode=0, no trails in 3D).
+                //
+                // Three tiers, the same three the main 3D pass uses: full
+                // models up to VEHICLE_FULL_MODEL_LIMIT (and always for the
+                // selected vehicle), marker spheres up to
+                // VEHICLE_MARKER_LIMIT, points beyond it. Ungated, this loop
+                // drew every vehicle at full detail into all three targets —
+                // at 25 vehicles that is 75 full-model draws per frame
+                // against the main pass's one, so the summary views cost
+                // more than the world they summarise.
+                //
+                // The top tier is a point rather than nothing, and it has to
+                // be: the 2D trail overlay further down is ungated, so a
+                // vehicle above the limit still draws its whole trail here.
+                // Dropping its position would leave a trail leading to an
+                // empty spot in the one view whose job is showing where
+                // everything is. No fixture can reach this tier -- the
+                // injector caps at 16 vehicles -- which is why it was missing.
+                //
+                // What is deliberately *not* mirrored is the density heatmap
+                // the main pass draws at this tier. That is a world-view
+                // instrument, and three more of it -- one per render target --
+                // would cost more than the point draws it accompanies.
                 for (int i = 0; i < vehicle_count; i++) {
-                    if (vehicles[i].active || vehicle_count == 1) {
+                    if (!(vehicles[i].active || vehicle_count == 1)) continue;
+                    if (vehicle_count <= VEHICLE_FULL_MODEL_LIMIT || i == selected) {
                         vehicle_draw((vehicle_t *)&vehicles[i], theme, i == selected,
                                      0, false, op->cameras[v].position, false);
+                    } else if (vehicle_count <= VEHICLE_MARKER_LIMIT) {
+                        vehicle_draw_sphere(vehicles[i].position, 0.18f,
+                                            vehicles[i].color);
+                    } else {
+                        // Batched into the same RL_LINES draw call, as in main.
+                        DrawPoint3D(vehicles[i].position, vehicles[i].color);
                     }
                 }
 

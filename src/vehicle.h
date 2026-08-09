@@ -55,6 +55,16 @@ extern const vehicle_model_info_t vehicle_models[];
 extern const int vehicle_model_count;
 
 // Default model indices (match vehicle_models[] order in vehicle.c)
+/* Level-of-detail thresholds, shared by every pass that draws vehicles.
+ *
+ * Named here rather than repeated as literals because the two passes drifting
+ * apart *was* a bug: the main 3D pass gated at 16 while the orthographic
+ * panel drew every vehicle at full detail into three render targets, so a
+ * 25-vehicle fleet cost 75 full-model draws per frame in the summary views
+ * against one in the world view. */
+#define VEHICLE_FULL_MODEL_LIMIT 16
+#define VEHICLE_MARKER_LIMIT     60
+
 #define MODEL_QUADROTOR   0
 #define MODEL_FIXEDWING   1
 #define MODEL_TAILSITTER  2
@@ -184,5 +194,13 @@ void vehicle_draw_correlation_line(
 
 // Unload model resources.
 void vehicle_cleanup(vehicle_t *v);
+
+// Draw a sphere from one shared, pre-uploaded unit mesh.
+// Drop-in for raylib's DrawSphere(), which re-tessellates 1,536 vertices on the
+// CPU through rlVertex3f on every call. Same radius, colour and position.
+void vehicle_draw_sphere(Vector3 center, float radius, Color color);
+
+// Release the shared geometry above. Call once, before CloseWindow().
+void vehicle_unload_shared(void);
 
 #endif

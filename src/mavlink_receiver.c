@@ -1,3 +1,9 @@
+#ifdef __linux__
+// recvmmsg() and struct mmsghdr are GNU extensions; the build uses -std=gnu11,
+// which does not imply _GNU_SOURCE. Must precede every include.
+#define _GNU_SOURCE
+#endif
+
 #include "mavlink_receiver.h"
 
 #include <stdio.h>
@@ -178,148 +184,253 @@ int mavlink_receiver_init(mavlink_receiver_t *recv, uint16_t port, uint8_t chann
     return 0;
 }
 
-void mavlink_receiver_poll(mavlink_receiver_t *recv) {
+// Feed one datagram through the MAVLink byte parser. Split out of
+// mavlink_receiver_poll() so the batched and the portable receive paths below
+// dispatch messages through exactly the same code.
+static void parse_datagram(mavlink_receiver_t *recv, const uint8_t *buf, int n) {
+    mavlink_message_t msg;
+    mavlink_status_t status;
+
+    // Frame offsets are datagram-local, exactly as before: one call per
+    // datagram, so a frame never spans two of them.
+    size_t frame_start = 0;
+
+    for (int i = 0; i < n; i++) {
+        if (mavlink_parse_char(recv->channel, buf[i], &msg, &status)) {
+            if (recv->on_frame) {
+                // Hand on the exact bytes as they arrived: a recorder that
+                // re-encodes would quietly normalise away the framing the
+                // viewer actually saw.
+                const size_t frame_len = (size_t)i + 1 - frame_start;
+                recv->on_frame(recv->frame_user, &msg, buf + frame_start,
+                               (uint16_t)frame_len, mavlink_receiver_unix_ns());
+            }
+            frame_start = (size_t)i + 1;
+
+            if (recv->debug) {
+                printf("[MAVLink] msgid=%u sysid=%u compid=%u seq=%u len=%u\n",
+                       msg.msgid, msg.sysid, msg.compid, msg.seq, msg.len);
+            }
+
+            switch (msg.msgid) {
+                case MAVLINK_MSG_ID_HEARTBEAT: {
+                    mavlink_heartbeat_t hb;
+                    mavlink_msg_heartbeat_decode(&msg, &hb);
+                    recv->mav_type = hb.type;
+                    if (!recv->connected) {
+                        recv->connected = true;
+                        recv->sysid = msg.sysid;
+                        printf("Connected to system %u (type %u)\n", msg.sysid, hb.type);
+                        request_home_position(recv);
+                        request_native_position_stream(recv);
+                    }
+                    break;
+                }
+
+                case MAVLINK_MSG_ID_HOME_POSITION: {
+                    mavlink_home_position_t hp;
+                    mavlink_msg_home_position_decode(&msg, &hp);
+                    recv->home.lat = hp.latitude;
+                    recv->home.lon = hp.longitude;
+                    recv->home.alt = hp.altitude;
+                    recv->home.valid = true;
+                    printf("Home position: lat=%.7f lon=%.7f alt=%.1fm\n",
+                           hp.latitude * 1e-7, hp.longitude * 1e-7, hp.altitude * 1e-3);
+                    break;
+                }
+
+                case MAVLINK_MSG_ID_HIL_STATE_QUATERNION: {
+                    mavlink_hil_state_quaternion_t hil;
+                    mavlink_msg_hil_state_quaternion_decode(&msg, &hil);
+
+                    recv->state.quaternion[0] = hil.attitude_quaternion[0];
+                    recv->state.quaternion[1] = hil.attitude_quaternion[1];
+                    recv->state.quaternion[2] = hil.attitude_quaternion[2];
+                    recv->state.quaternion[3] = hil.attitude_quaternion[3];
+                    recv->state.lat = hil.lat;
+                    recv->state.lon = hil.lon;
+                    recv->state.alt = hil.alt;
+                    recv->state.vx = hil.vx;
+                    recv->state.vy = hil.vy;
+                    recv->state.vz = hil.vz;
+                    recv->state.ind_airspeed = hil.ind_airspeed;
+                    recv->state.true_airspeed = hil.true_airspeed;
+                    recv->state.time_usec = hil.time_usec;
+                    recv->state.valid = true;
+                    recv->hil_valid = true;
+
+                    if (recv->debug) {
+                        printf("  HIL_STATE_Q: lat=%d lon=%d alt=%d q=[%.3f,%.3f,%.3f,%.3f]\n",
+                               hil.lat, hil.lon, hil.alt,
+                               hil.attitude_quaternion[0], hil.attitude_quaternion[1],
+                               hil.attitude_quaternion[2], hil.attitude_quaternion[3]);
+                    }
+                    break;
+                }
+
+                case MAVLINK_MSG_ID_ATTITUDE: {
+                    // Fallback only. PX4 streams ATTITUDE alongside
+                    // HIL_STATE_QUATERNION; taking it would downgrade the
+                    // attitude and mix boot-relative into absolute time.
+                    if (recv->hil_valid) break;
+                    mavlink_attitude_t attitude;
+                    mavlink_msg_attitude_decode(&msg, &attitude);
+                    euler_to_quaternion(attitude.roll, attitude.pitch,
+                                        attitude.yaw, recv->state.quaternion);
+                    recv->attitude_valid = true;
+                    recv->state.time_usec = (uint64_t)attitude.time_boot_ms * 1000ULL;
+                    recv->state.valid = recv->global_position_valid;
+
+                    if (recv->debug) {
+                        printf("  ATTITUDE: rpy=[%.3f,%.3f,%.3f] q=[%.3f,%.3f,%.3f,%.3f]\n",
+                               attitude.roll, attitude.pitch, attitude.yaw,
+                               recv->state.quaternion[0], recv->state.quaternion[1],
+                               recv->state.quaternion[2], recv->state.quaternion[3]);
+                    }
+                    break;
+                }
+
+                case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
+                    if (recv->hil_valid) break;  // see ATTITUDE above
+                    mavlink_global_position_int_t position;
+                    mavlink_msg_global_position_int_decode(&msg, &position);
+                    recv->state.lat = position.lat;
+                    recv->state.lon = position.lon;
+                    recv->state.alt = position.alt;
+                    recv->state.vx = position.vx;
+                    recv->state.vy = position.vy;
+                    recv->state.vz = position.vz;
+                    recv->state.time_usec = (uint64_t)position.time_boot_ms * 1000ULL;
+                    recv->global_position_valid = true;
+                    recv->state.valid = recv->attitude_valid;
+
+                    if (recv->debug) {
+                        printf("  GLOBAL_POSITION_INT: lat=%d lon=%d alt=%d vel=[%d,%d,%d]\n",
+                               position.lat, position.lon, position.alt,
+                               position.vx, position.vy, position.vz);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#ifdef __linux__
+// One recvfrom() per datagram is what the profile caught: 25 vehicles at 60 fps
+// issued ~7,125 recvfrom syscalls/s, 1,500 of which were pure EAGAIN "nothing
+// here" returns. recvmmsg() lifts up to RECV_BATCH datagrams per syscall.
+#define RECV_BATCH 32
+#define RECV_BUFSZ 2048
+
+// Receive scratch shared by every receiver. Polling happens on the render
+// thread only, one socket at a time, and nothing here outlives the call, so a
+// single copy is enough — per-receiver buffers would cost 64 KB x 255 vehicles.
+static uint8_t            batch_buf[RECV_BATCH][RECV_BUFSZ];
+static struct mmsghdr     batch_msgs[RECV_BATCH];
+static struct iovec       batch_iov[RECV_BATCH];
+static struct sockaddr_in batch_addr[RECV_BATCH];
+#endif
+
+// Drain the socket one datagram per syscall. This is the portable path, and on
+// Linux it is also the fallback when recvmmsg turns out not to be usable.
+static bool drain_single(mavlink_receiver_t *recv) {
+    bool got = false;
     uint8_t buf[2048];
     struct sockaddr_in sender;
-    socklen_t sender_len = sizeof(sender);
-    bool got_data = false;
 
     for (;;) {
+        // Reset per call: recvfrom writes the actual address length back, so a
+        // shared variable would hand the next call whatever the last one left.
+        socklen_t sender_len = sizeof(sender);
         int n = recvfrom(recv->sockfd, (char *)buf, sizeof(buf), 0,
                          (struct sockaddr *)&sender, &sender_len);
         if (n <= 0) break;
 
-        got_data = true;
+        got = true;
 
         if (!recv->sender_known) {
             memcpy(recv->sender_addr, &sender, sizeof(struct sockaddr_in));
             recv->sender_known = true;
         }
 
-        mavlink_message_t msg;
-        mavlink_status_t status;
-
-        size_t frame_start = 0;
-        for (int i = 0; i < n; i++) {
-            if (mavlink_parse_char(recv->channel, buf[i], &msg, &status)) {
-                if (recv->on_frame) {
-                    // Hand on the exact bytes as they arrived: a recorder that
-                    // re-encodes would quietly normalise away the framing the
-                    // viewer actually saw.
-                    const size_t frame_len = (size_t)i + 1 - frame_start;
-                    recv->on_frame(recv->frame_user, &msg, buf + frame_start,
-                                   (uint16_t)frame_len, mavlink_receiver_unix_ns());
-                }
-                frame_start = (size_t)i + 1;
-
-                if (recv->debug) {
-                    printf("[MAVLink] msgid=%u sysid=%u compid=%u seq=%u len=%u\n",
-                           msg.msgid, msg.sysid, msg.compid, msg.seq, msg.len);
-                }
-
-                switch (msg.msgid) {
-                    case MAVLINK_MSG_ID_HEARTBEAT: {
-                        mavlink_heartbeat_t hb;
-                        mavlink_msg_heartbeat_decode(&msg, &hb);
-                        recv->mav_type = hb.type;
-                        if (!recv->connected) {
-                            recv->connected = true;
-                            recv->sysid = msg.sysid;
-                            printf("Connected to system %u (type %u)\n", msg.sysid, hb.type);
-                            request_home_position(recv);
-                            request_native_position_stream(recv);
-                        }
-                        break;
-                    }
-
-                    case MAVLINK_MSG_ID_HOME_POSITION: {
-                        mavlink_home_position_t hp;
-                        mavlink_msg_home_position_decode(&msg, &hp);
-                        recv->home.lat = hp.latitude;
-                        recv->home.lon = hp.longitude;
-                        recv->home.alt = hp.altitude;
-                        recv->home.valid = true;
-                        printf("Home position: lat=%.7f lon=%.7f alt=%.1fm\n",
-                               hp.latitude * 1e-7, hp.longitude * 1e-7, hp.altitude * 1e-3);
-                        break;
-                    }
-
-                    case MAVLINK_MSG_ID_HIL_STATE_QUATERNION: {
-                        mavlink_hil_state_quaternion_t hil;
-                        mavlink_msg_hil_state_quaternion_decode(&msg, &hil);
-
-                        recv->state.quaternion[0] = hil.attitude_quaternion[0];
-                        recv->state.quaternion[1] = hil.attitude_quaternion[1];
-                        recv->state.quaternion[2] = hil.attitude_quaternion[2];
-                        recv->state.quaternion[3] = hil.attitude_quaternion[3];
-                        recv->state.lat = hil.lat;
-                        recv->state.lon = hil.lon;
-                        recv->state.alt = hil.alt;
-                        recv->state.vx = hil.vx;
-                        recv->state.vy = hil.vy;
-                        recv->state.vz = hil.vz;
-                        recv->state.ind_airspeed = hil.ind_airspeed;
-                        recv->state.true_airspeed = hil.true_airspeed;
-                        recv->state.time_usec = hil.time_usec;
-                        recv->state.valid = true;
-                        recv->hil_valid = true;
-
-                        if (recv->debug) {
-                            printf("  HIL_STATE_Q: lat=%d lon=%d alt=%d q=[%.3f,%.3f,%.3f,%.3f]\n",
-                                   hil.lat, hil.lon, hil.alt,
-                                   hil.attitude_quaternion[0], hil.attitude_quaternion[1],
-                                   hil.attitude_quaternion[2], hil.attitude_quaternion[3]);
-                        }
-                        break;
-                    }
-
-                    case MAVLINK_MSG_ID_ATTITUDE: {
-                        // Fallback only. PX4 streams ATTITUDE alongside
-                        // HIL_STATE_QUATERNION; taking it would downgrade the
-                        // attitude and mix boot-relative into absolute time.
-                        if (recv->hil_valid) break;
-                        mavlink_attitude_t attitude;
-                        mavlink_msg_attitude_decode(&msg, &attitude);
-                        euler_to_quaternion(attitude.roll, attitude.pitch,
-                                            attitude.yaw, recv->state.quaternion);
-                        recv->attitude_valid = true;
-                        recv->state.time_usec = (uint64_t)attitude.time_boot_ms * 1000ULL;
-                        recv->state.valid = recv->global_position_valid;
-
-                        if (recv->debug) {
-                            printf("  ATTITUDE: rpy=[%.3f,%.3f,%.3f] q=[%.3f,%.3f,%.3f,%.3f]\n",
-                                   attitude.roll, attitude.pitch, attitude.yaw,
-                                   recv->state.quaternion[0], recv->state.quaternion[1],
-                                   recv->state.quaternion[2], recv->state.quaternion[3]);
-                        }
-                        break;
-                    }
-
-                    case MAVLINK_MSG_ID_GLOBAL_POSITION_INT: {
-                        if (recv->hil_valid) break;  // see ATTITUDE above
-                        mavlink_global_position_int_t position;
-                        mavlink_msg_global_position_int_decode(&msg, &position);
-                        recv->state.lat = position.lat;
-                        recv->state.lon = position.lon;
-                        recv->state.alt = position.alt;
-                        recv->state.vx = position.vx;
-                        recv->state.vy = position.vy;
-                        recv->state.vz = position.vz;
-                        recv->state.time_usec = (uint64_t)position.time_boot_ms * 1000ULL;
-                        recv->global_position_valid = true;
-                        recv->state.valid = recv->attitude_valid;
-
-                        if (recv->debug) {
-                            printf("  GLOBAL_POSITION_INT: lat=%d lon=%d alt=%d vel=[%d,%d,%d]\n",
-                                   position.lat, position.lon, position.alt,
-                                   position.vx, position.vy, position.vz);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
+        parse_datagram(recv, buf, n);
     }
+    return got;
+}
+
+#ifdef __linux__
+// recvmmsg is a Linux syscall, and being on Linux is not enough to have it: it
+// returns ENOSYS under qemu-user and older WSL1, and EPERM under a seccomp
+// profile that allowlists recvfrom but not recvmmsg. The first version of this
+// treated every non-positive return as "queue empty", which in those
+// environments means the viewer connects, shows a live link, and displays no
+// telemetry at all, forever, with nothing on stderr. A syscall saved is not
+// worth that, so a hard failure stands the batch path down for the rest of the
+// process and drain_single takes over -- including for the datagrams still
+// queued in this same poll.
+static bool batch_available = true;
+
+static bool drain_batched(mavlink_receiver_t *recv) {
+    bool got = false;
+
+    for (;;) {
+        for (int i = 0; i < RECV_BATCH; i++) {
+            batch_iov[i].iov_base = batch_buf[i];
+            batch_iov[i].iov_len = RECV_BUFSZ;
+            batch_msgs[i].msg_len = 0;
+            batch_msgs[i].msg_hdr = (struct msghdr){
+                .msg_name = &batch_addr[i],
+                .msg_namelen = sizeof(batch_addr[i]),
+                .msg_iov = &batch_iov[i],
+                .msg_iovlen = 1,
+            };
+        }
+
+        // The socket stays non-blocking, so this hands back whatever is queued
+        // right now and -1/EAGAIN once the queue is empty.
+        const int count = recvmmsg(recv->sockfd, batch_msgs, RECV_BATCH, 0, NULL);
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;   // drained
+            fprintf(stderr,
+                    "mavlink: recvmmsg unusable (%s); falling back to one "
+                    "datagram per syscall\n", strerror(errno));
+            batch_available = false;
+            break;
+        }
+        if (count == 0) break;
+
+        got = true;
+
+        if (!recv->sender_known) {
+            memcpy(recv->sender_addr, &batch_addr[0], sizeof(struct sockaddr_in));
+            recv->sender_known = true;
+        }
+
+        for (int i = 0; i < count; i++)
+            parse_datagram(recv, batch_buf[i], (int)batch_msgs[i].msg_len);
+
+        // A short batch means the queue is drained; skip the follow-up syscall
+        // that could only return EAGAIN.
+        if (count < RECV_BATCH) break;
+    }
+    return got;
+}
+#endif
+
+void mavlink_receiver_poll(mavlink_receiver_t *recv) {
+    bool got_data = false;
+
+#ifdef __linux__
+    if (batch_available) got_data = drain_batched(recv);
+    // Not an else: a batch path that just stood itself down leaves whatever was
+    // queued behind it, and that is exactly the poll where dropping it would
+    // look like a dead link.
+    if (!batch_available) got_data = drain_single(recv) || got_data;
+#else
+    got_data = drain_single(recv);
+#endif
 
     if (got_data) {
         recv->last_msg_time = get_wall_time();
