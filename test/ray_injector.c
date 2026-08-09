@@ -951,6 +951,75 @@ static bool sim_raycast(const sim_t *s, double t, const double origin[3],
     return geom_scene_raycast(&s->scene, t, origin, dir, max_m, t_hit, NULL);
 }
 
+// A proximity sensor reports the nearest surface anywhere in its beam, which is
+// not the range along the boresight. Casting one pencil ray per sector models a
+// sensor that can see past an obstacle filling most of its cone, and a map that
+// carves the whole cone is then told the cone is clear when it is not -- the
+// resulting false-free is the fixture's, not the map's.
+//
+// Thirteen sub-rays: the axis, then rings of four and eight at half and full
+// beam radius. Density was swept at 13 / 33 / 65 per sector and the scores came
+// out flat, so the cheapest one is the honest one.
+//
+// `out_dir` comes back as the sub-ray that actually produced the reading, so
+// the published truth ray ends where the surface really is rather than at that
+// range along an axis pointing somewhere else.
+//
+// A sensor that declares no field of view still gets the axis and nothing else,
+// which is the same reading it always got.
+static bool sim_beam_min(const sim_t *s, double t, const double origin[3],
+                         const double axis[3], double half_angle_rad, double max_m,
+                         double out_dir[3], double *out_range) {
+    memcpy(out_dir, axis, 3 * sizeof(double));
+    *out_range = max_m;
+    bool hit = false;
+
+    double t_hit;
+    if (sim_raycast(s, t, origin, axis, max_m, &t_hit)) {
+        *out_range = t_hit;
+        hit = true;
+    }
+    if (!(half_angle_rad > 0.0)) return hit;
+
+    double u[3], v[3];
+    {
+        const double ax = fabs(axis[0]), ay = fabs(axis[1]), az = fabs(axis[2]);
+        double w[3] = { 0.0, 0.0, 0.0 };
+        if (ax <= ay && ax <= az) w[0] = 1.0;
+        else if (ay <= az)        w[1] = 1.0;
+        else                      w[2] = 1.0;
+        u[0] = w[1] * axis[2] - w[2] * axis[1];
+        u[1] = w[2] * axis[0] - w[0] * axis[2];
+        u[2] = w[0] * axis[1] - w[1] * axis[0];
+        const double n = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+        if (!(n > 1e-9)) return hit;
+        for (int i = 0; i < 3; i++) u[i] /= n;
+        v[0] = axis[1] * u[2] - axis[2] * u[1];
+        v[1] = axis[2] * u[0] - axis[0] * u[2];
+        v[2] = axis[0] * u[1] - axis[1] * u[0];
+    }
+
+    const double edge = tan(half_angle_rad);
+    for (int ring = 1; ring <= 2; ring++) {
+        const double off = edge * (double)ring * 0.5;
+        const int count = ring * 4;
+        for (int j = 0; j < count; j++) {
+            const double phi = 2.0 * M_PI * (double)j / (double)count;
+            double d[3];
+            for (int i = 0; i < 3; i++)
+                d[i] = axis[i] + off * (u[i] * cos(phi) + v[i] * sin(phi));
+            const double n = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (int i = 0; i < 3; i++) d[i] /= n;
+            if (!sim_raycast(s, t, origin, d, max_m, &t_hit)) continue;
+            if (hit && t_hit >= *out_range) continue;
+            *out_range = t_hit;
+            memcpy(out_dir, d, sizeof(d));
+            hit = true;
+        }
+    }
+    return hit;
+}
+
 static void record_truth_ray(sim_t *s, double t, int veh, const double origin[3],
                              const double dir[3], double range, bool hit) {
     if (!s->have_truth) return;
@@ -985,17 +1054,13 @@ static void emit_distance_sensor(sim_t *s, int veh, double t, const sim_pose_t *
         q_override = q_nb;
     }
 
-    double dir[3];
-    sensor_axis_enu(p, &c, q_override, dir);
+    double axis[3];
+    sensor_axis_enu(p, &c, q_override, axis);
 
     const double max_m = (double)c.max_cm * 0.01;
-    double range = max_m;
-    bool hit = false;
-    double t_hit;
-    if (sim_raycast(s, t, p->enu, dir, max_m, &t_hit)) {
-        range = t_hit;
-        hit = true;
-    }
+    const double fov = (c.h_fov > c.v_fov) ? c.h_fov : c.v_fov;
+    double dir[3], range;
+    const bool hit = sim_beam_min(s, t, p->enu, axis, fov * 0.5, max_m, dir, &range);
     record_truth_ray(s, t, veh, p->enu, dir, range, hit);
 
     // The mount test flies whatever attitude puts the sensor under test facing
@@ -1088,15 +1153,13 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
         const double body[3] = { cos(bearing), sin(bearing), 0.0 };
         double ned[3];
         ob_quat_rotate(q_nb, body, ned);
-        const double dir[3] = { ned[1], ned[0], -ned[2] };
+        const double axis[3] = { ned[1], ned[0], -ned[2] };
 
-        double range = max_m;
-        bool hit = false;
-        double t_hit;
-        if (sim_raycast(s, t, p->enu, dir, max_m, &t_hit)) {
-            range = t_hit;
-            hit = true;
-        }
+        // The sector's own width is its beam width -- that is what one distance
+        // per sector means, and it is the width the map reconstructs.
+        double dir[3], range;
+        const bool hit = sim_beam_min(s, t, p->enu, axis, (double)increment * DEG * 0.5,
+                                      max_m, dir, &range);
         record_truth_ray(s, t, veh, p->enu, dir, range, hit);
         distances[i] = (uint16_t)lrint(range * 100.0);
     }
