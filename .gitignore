@@ -1,7 +1,7 @@
-build/
+# Any build tree: build/, plus the sanitizer and per-config ones the Makefile
+# targets create (build-asan/, build-debug/, build-release/, ...).
+build*/
 .DS_Store
-build-debug/
-build-release/
 .dmux/
 .dmux-hooks/
 

@@ -28,6 +28,12 @@
 #include "replay_markers.h"
 #include "ui_marker_input.h"
 #include "tactical_hud.h"
+#include "map_session.h"
+#include "map_render.h"
+#include "capture.h"
+#include "map_hud.h"
+#include "quality_overlay.h"
+#include "skynet_manifest.h"
 
 #define VEHICLE_SANITY_LIMIT 255
 // Selector paging is shared with the numpad renderer; see hud.h.
@@ -51,6 +57,22 @@ static void print_usage(const char *prog) {
     printf("  --ghost <file1.ulg> [file2.ulg ...]   Ghost mode replay\n");
     printf("  -w <width>     Window width (default: 1280)\n");
     printf("  -h <height>    Window height (default: 720)\n");
+    printf("\n  Fleet map (shared occupancy map built from ranging messages):\n");
+    printf("  --tlog <f.tlog> [...]  Replay tlog(s): raw frames with arrival times\n");
+    printf("  --bin <f.bin> [...]    Replay ArduPilot DataFlash log(s)\n");
+    printf("  --run <run.json>       Open a skynet run record (a manifest of logs)\n");
+    printf("  --record <out.tlog>    Record live MAVLink to a tlog as the viewer saw it\n");
+    printf("  --no-map               Do not build the shared map\n");
+    printf("  --map-cap <MiB>        Map memory ceiling (default: 256)\n");
+    printf("  --map-res <m>          Leaf size in metres (default: 0.25)\n");
+    printf("  --map-origin centroid  Use the fleet centroid rather than the first origin\n");
+    printf("  --view <mode>          Start in a fullscreen ortho view: top, bottom,\n");
+    printf("                         front, back, left, right (chase = default)\n");
+    printf("  --view-span <m>        Ortho span in metres (default: fit to the map)\n");
+    printf("  --follow-map           Aim the camera at the map, not the aircraft\n");
+    printf("  --map-mode <mode>      occupancy, coverage, divergence, contribution\n");
+    printf("  --focus <n>            Focus vehicle n (0-based) for contribution\n");
+    printf("  --map-hide-free        Draw occupied cells only, not carved space\n");
 }
 
 /* Thin wrapper: delegates to the testable inline in ui_logic.h */
@@ -211,7 +233,33 @@ int main(int argc, char *argv[]) {
     int num_replay_files = 0;
     bool ghost_mode = false;
 
+    // Shared fleet map. Every source feeds the same one; the source kind only
+    // decides who does the decoding.
+    typedef enum { SRC_MAVLINK, SRC_ULOG, SRC_TLOG, SRC_BIN } src_kind_t;
+    src_kind_t replay_kind = SRC_ULOG;
+    const char *record_path = NULL;
+    const char *run_manifest = NULL;
+    bool  map_enabled = true;
+    double map_cap_mib = 256.0;
+    double map_res_m = 0.25;
+    fleet_origin_policy_t map_origin_policy = FLEET_ORIGIN_FIRST_SEEN;
+
+    capture_t capture;
+    capture_defaults(&capture);
+
+    // Framing for an unattended run. Nobody is there to press Alt+2 or drag the
+    // camera onto the map, so the view has to be settable from the command line
+    // for a recording to show anything worth recording.
+    ortho_mode_t start_view = ORTHO_NONE;
+    const char *start_map_mode = NULL;   // occupancy | coverage | divergence | contribution
+    int    start_focus = -1;
+    bool   hide_free = false;
+    double view_span_m = 0.0;      // 0 = fit to the map
+    bool   follow_map = false;
+
     for (int i = 1; i < argc; i++) {
+        const int taken = capture_parse_arg(&capture, argc, argv, i);
+        if (taken > 0) { i += taken - 1; continue; }
         if (strcmp(argv[i], "-udp") == 0 && i + 1 < argc) {
             base_port = (uint16_t)atoi(argv[++i]);
         } else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -258,10 +306,74 @@ int main(int argc, char *argv[]) {
                 }
                 replay_paths[num_replay_files++] = argv[++i];
             }
+        } else if (strcmp(argv[i], "--tlog") == 0 || strcmp(argv[i], "--bin") == 0) {
+            replay_kind = (strcmp(argv[i], "--tlog") == 0) ? SRC_TLOG : SRC_BIN;
+            while (i + 1 < argc && argv[i + 1][0] != '-') {
+                if (num_replay_files >= VEHICLE_SANITY_LIMIT) {
+                    fprintf(stderr, "Too many replay files (max %d)\n", VEHICLE_SANITY_LIMIT);
+                    free(replay_paths);
+                    return 1;
+                }
+                replay_paths[num_replay_files++] = argv[++i];
+            }
+        } else if (strcmp(argv[i], "--run") == 0 && i + 1 < argc) {
+            run_manifest = argv[++i];
+        } else if (strcmp(argv[i], "--record") == 0 && i + 1 < argc) {
+            record_path = argv[++i];
+        } else if (strcmp(argv[i], "--no-map") == 0) {
+            map_enabled = false;
+        } else if (strcmp(argv[i], "--map-cap") == 0 && i + 1 < argc) {
+            map_cap_mib = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--map-res") == 0 && i + 1 < argc) {
+            map_res_m = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--map-origin") == 0 && i + 1 < argc) {
+            map_origin_policy = (strcmp(argv[++i], "centroid") == 0)
+                ? FLEET_ORIGIN_CENTROID : FLEET_ORIGIN_FIRST_SEEN;
+        } else if (strcmp(argv[i], "--map-mode") == 0 && i + 1 < argc) {
+            start_map_mode = argv[++i];
+        } else if (strcmp(argv[i], "--focus") == 0 && i + 1 < argc) {
+            start_focus = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--map-hide-free") == 0) {
+            hide_free = true;
+        } else if (strcmp(argv[i], "--view") == 0 && i + 1 < argc) {
+            const char *v = argv[++i];
+            if      (strcmp(v, "top") == 0)    start_view = ORTHO_TOP;
+            else if (strcmp(v, "bottom") == 0) start_view = ORTHO_BOTTOM;
+            else if (strcmp(v, "front") == 0)  start_view = ORTHO_FRONT;
+            else if (strcmp(v, "back") == 0)   start_view = ORTHO_BACK;
+            else if (strcmp(v, "left") == 0)   start_view = ORTHO_LEFT;
+            else if (strcmp(v, "right") == 0)  start_view = ORTHO_RIGHT;
+            else if (strcmp(v, "chase") == 0)  start_view = ORTHO_NONE;
+            else { fprintf(stderr, "unknown --view %s\n", v); return 1; }
+            follow_map = true;
+        } else if (strcmp(argv[i], "--view-span") == 0 && i + 1 < argc) {
+            view_span_m = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--follow-map") == 0) {
+            follow_map = true;
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
+            capture_usage();
             return 0;
         }
+    }
+
+    // A skynet run record is a manifest, not a log: it names the sources and we
+    // open them with the parsers that already exist.
+    skynet_manifest_t manifest;
+    bool have_manifest = false;
+    if (run_manifest) {
+        char err[256] = {0};
+        if (skynet_manifest_load(&manifest, run_manifest, err, sizeof(err)) != 0) {
+            fprintf(stderr, "Failed to open run record %s: %s\n", run_manifest, err);
+            free(replay_paths);
+            return 1;
+        }
+        have_manifest = true;
+        num_replay_files = 0;
+        for (int e = 0; e < manifest.entry_count && num_replay_files < VEHICLE_SANITY_LIMIT; e++)
+            replay_paths[num_replay_files++] = manifest.entries[e].path;
+        printf("Run %s: %d log(s)\n",
+               manifest.run_id[0] ? manifest.run_id : run_manifest, num_replay_files);
     }
 
     if ((unsigned int)base_port + (unsigned int)vehicle_count > 65535U) {
@@ -289,14 +401,67 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    // One shared map for the whole fleet, created before the sources so each
+    // source can be attached to it as it opens.
+    map_session_t map_session;
+    bool map_ready = false;
+    if (map_enabled) {
+        map_session_config_t mcfg;
+        map_session_config_defaults(&mcfg);
+        mcfg.map_byte_cap = (size_t)(map_cap_mib * 1024.0 * 1024.0);
+        mcfg.max_vehicles = vehicle_count;
+        mcfg.origin_policy = map_origin_policy;
+        // Leaf size sets the depth under the fixed 4096 m root.
+        if (map_res_m > 0.0) {
+            int depth = (int)ceil(log2(4096.0 / map_res_m));
+            if (depth < 6) depth = 6;
+            if (depth > 16) depth = 16;
+            mcfg.max_depth = depth;
+            mcfg.coarse_depth = depth - 3;   // ~8x coarser for far-field carving
+        }
+        if (map_session_init(&map_session, &mcfg) == 0) {
+            map_ready = true;
+            if (origin_specified)
+                fleet_frame_set_explicit(&map_session.frame, origin_lat, origin_lon, origin_alt);
+        } else {
+            fprintf(stderr, "Failed to create the shared map; continuing without it\n");
+        }
+    }
+    struct map_session *map_ptr = map_ready ? (struct map_session *)&map_session : NULL;
+
     if (is_replay) {
         for (int i = 0; i < num_replay_files; i++) {
-            if (data_source_ulog_create(&sources[i], replay_paths[i]) != 0) {
-                fprintf(stderr, "Failed to open ULog: %s\n", replay_paths[i]);
+            int rc = -1;
+            src_kind_t kind = replay_kind;
+            if (have_manifest && i < manifest.entry_count) {
+                switch (manifest.entries[i].kind) {
+                    case SKYNET_LOG_TLOG:      kind = SRC_TLOG; break;
+                    case SKYNET_LOG_DATAFLASH: kind = SRC_BIN;  break;
+                    default:                   kind = SRC_ULOG; break;
+                }
+            }
+            switch (kind) {
+                case SRC_TLOG:
+                    rc = data_source_tlog_create(&sources[i], replay_paths[i],
+                                                 map_ptr, i, (uint8_t)i);
+                    break;
+                case SRC_BIN:
+                    rc = data_source_bin_create(&sources[i], replay_paths[i], map_ptr, i);
+                    break;
+                default:
+                    rc = data_source_ulog_create(&sources[i], replay_paths[i]);
+                    if (rc == 0) data_source_attach_map(&sources[i], map_ptr, i);
+                    break;
+            }
+            if (rc != 0) {
+                fprintf(stderr, "Failed to open %s\n", replay_paths[i]);
                 free(replay_paths); free(sources);
                 CloseWindow();
                 return 1;
             }
+            if (map_ready) map_session_bind_slot(&map_session, i, (uint8_t)(i + 1));
+            if (have_manifest && i < manifest.entry_count && manifest.entries[i].has_offset)
+                data_source_set_time_offset(&sources[i], manifest.entries[i].time_offset_s);
         }
     } else {
         for (int i = 0; i < vehicle_count; i++) {
@@ -306,8 +471,30 @@ int main(int argc, char *argv[]) {
                 CloseWindow();
                 return 1;
             }
+            data_source_attach_map(&sources[i], map_ptr, i);
+            if (map_ready) map_session_bind_slot(&map_session, i, (uint8_t)(i + 1));
+
+            // The tlog recorder is the only thing that preserves latency, loss
+            // and ordering as the viewer actually saw them.
+            if (record_path) {
+                char path[1024];
+                if (vehicle_count > 1) snprintf(path, sizeof(path), "%s.%d", record_path, i);
+                else snprintf(path, sizeof(path), "%s", record_path);
+                if (data_source_mavlink_record(&sources[i], path) != 0)
+                    fprintf(stderr, "Failed to open tlog for writing: %s\n", path);
+                else
+                    printf("Recording vehicle %d to %s\n", i, path);
+            }
         }
     }
+
+    map_render_t map_render;
+    bool map_render_ready = map_ready && (map_render_init(&map_render) == 0);
+    map_hud_opts_t map_hud_opts;
+    map_hud_defaults(&map_hud_opts);
+    quality_overlay_opts_t quality_opts;
+    quality_overlay_defaults(&quality_opts);
+    bool show_map_panel = map_ready;
 
     // Init vehicles
     // Init scene first (provides lighting shader for vehicles)
@@ -554,6 +741,39 @@ int main(int argc, char *argv[]) {
     marker_input_t marker_input = {0};
     marker_input.target = -1;
 
+    if (map_render_ready) {
+        // Framing an unattended capture: the same switches the operator has on
+        // the keyboard, so a recording can show any of the map views.
+        if (start_map_mode) {
+            bool matched = false;
+            for (int m = 0; m < MAP_DRAW_MODE_COUNT; m++) {
+                if (strcmp(start_map_mode, map_draw_mode_name((map_draw_mode_t)m)) == 0) {
+                    map_render.mode = (map_draw_mode_t)m;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                fprintf(stderr, "hawkeye: unknown --map-mode %s (try:", start_map_mode);
+                for (int m = 0; m < MAP_DRAW_MODE_COUNT; m++)
+                    fprintf(stderr, " %s", map_draw_mode_name((map_draw_mode_t)m));
+                fprintf(stderr, ")\n");
+                return 1;
+            }
+        }
+        if (hide_free) map_render.show_free = false;
+    }
+    if (start_focus >= 0 && map_ready) map_session_set_focus(&map_session, start_focus);
+
+    if (start_view != ORTHO_NONE) {
+        scene.ortho_mode = start_view;
+        scene.ortho_span = (view_span_m > 0.0) ? (float)view_span_m : 60.0f;
+    }
+    if (follow_map && !map_ready)
+        fprintf(stderr, "hawkeye: --follow-map has nothing to follow with --no-map\n");
+
+    if (!capture_begin(&capture, "hawkeye")) return 1;
+
     // Main loop
     while (!WindowShouldClose()) {
         // Guard: if vehicle_count is somehow 0, exit the loop to avoid
@@ -631,6 +851,34 @@ int main(int argc, char *argv[]) {
                 }
             }
             last_pos[i] = vehicles[i].position;
+        }
+
+        // Advance the shared map. Live pins the playhead to the head of the
+        // data; scrubbing unpins it and the map is rebuilt to match. One code
+        // path, and the live view gets rewind for free.
+        if (map_ready) {
+            map_session_set_focus(&map_session, selected);
+            if (is_replay && vehicle_count > 0) {
+                // Replay drives the playhead from the transport position so the
+                // map and the trajectory never disagree about "now". Each
+                // source clamps its own position at its own end of log, so the
+                // shared playhead has to come from the furthest one still
+                // running -- otherwise loading a 60 s log beside a 600 s one
+                // freezes the map nine tenths of the way short while the other
+                // vehicle keeps flying.
+                const int64_t t0 = timeline_start_ns(&map_session.timeline);
+                double furthest = 0.0;
+                for (int i = 0; i < vehicle_count; i++) {
+                    if (sources[i].playback.position_s > furthest)
+                        furthest = sources[i].playback.position_s;
+                }
+                const int64_t want = t0 + (int64_t)(furthest * 1e9);
+                map_session.timeline.playhead.speed = sources[0].playback.speed;
+                map_session.timeline.playhead.paused = sources[0].playback.paused;
+                map_session_tick_at(&map_session, want, GetFrameTime());
+            } else {
+                map_session_tick(&map_session, GetFrameTime());
+            }
         }
 
         // Lazy-resolve system marker positions once origin is established
@@ -768,7 +1016,49 @@ int main(int argc, char *argv[]) {
 
         // Handle input (blocked during marker label entry)
         if (!marker_input.active) {
+        // The timeline widget gets the pointer first. It is drawn later, inside
+        // BeginDrawing, but its hit test has to run before the camera sees the
+        // same mouse button -- otherwise scrubbing the strip also orbits the
+        // view.
+        scene.ui_pointer_captured = false;
+        if (map_ready && map_hud_opts.show_timeline) {
+            const int th = (int)map_hud_opts.timeline_height;
+            scene.ui_pointer_captured =
+                map_hud_timeline_input(&map_session, 12, GetScreenHeight() - th - 12,
+                                       GetScreenWidth() - 24, th);
+        }
         scene_handle_input(&scene);
+
+        // Map controls. Deliberately few: the map is a view of the same data,
+        // not a separate application.
+        if (map_ready) {
+            const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            if (IsKeyPressed(KEY_J) && map_render_ready)
+                map_render_cycle_mode(&map_render, shift ? -1 : 1);
+            if (IsKeyPressed(KEY_U) && map_render_ready) {
+                if (shift) { map_render.show_free = !map_render.show_free;
+                             map_render_invalidate(&map_render); }
+                else map_render.visible = !map_render.visible;
+            }
+            if (IsKeyPressed(KEY_V)) {
+                if (shift) quality_opts.show_panel = !quality_opts.show_panel;
+                else show_map_panel = !show_map_panel;
+            }
+            if (IsKeyPressed(KEY_X)) {
+                // Per-vehicle solo/mute: which vehicles are allowed to write to
+                // the shared map.
+                if (shift)
+                    map_session_set_solo(&map_session,
+                                         map_session.solo_vehicle == selected ? -1 : selected);
+                else
+                    map_session_set_mute(&map_session, selected,
+                                         !map_session.veh[selected].muted);
+            }
+            if (IsKeyPressed(KEY_HOME)) {
+                timeline_pin_live(&map_session.timeline);
+                if (map_render_ready) map_render_invalidate(&map_render);
+            }
+        }
 
         // P key: switch between Swarm / Ghost / Grid modes during multi-file replay
         // P key: mode switcher for multi-file replay
@@ -1290,6 +1580,40 @@ int main(int argc, char *argv[]) {
             Vector3 cam_target = vehicles[selected].position;
             if (hud.mode == HUD_TACTICAL)
                 cam_target.y += scene.chase_distance * 0.10f;
+
+            // An unattended run frames the map rather than the aircraft. The
+            // two are not the same place: a vehicle whose origin has not
+            // resolved yet is drawn at the world origin while its rays are
+            // already landing wherever the fleet frame says they belong.
+            if (follow_map && map_ready) {
+                double lo[3], hi[3];
+                if (octomap_content_bounds(&map_session.map, lo, hi)) {
+                    const double mid[3] = { (lo[0] + hi[0]) * 0.5,
+                                            (lo[1] + hi[1]) * 0.5,
+                                            (lo[2] + hi[2]) * 0.5 };
+                    float w[3];
+                    fleet_enu_to_world(mid, w);
+                    cam_target = (Vector3){ w[0], w[1], w[2] };
+
+                    if (view_span_m > 0.0) {
+                        scene.ortho_span = (float)view_span_m;
+                    } else {
+                        // Fit, with a margin so the newest cells are not sitting
+                        // on the edge of frame the moment they appear.
+                        double span = hi[0] - lo[0];
+                        if (hi[1] - lo[1] > span) span = hi[1] - lo[1];
+                        if (hi[2] - lo[2] > span) span = hi[2] - lo[2];
+                        span *= 1.25;
+                        if (span < 10.0) span = 10.0;
+                        if (span > 500.0) span = 500.0;
+                        // Ease rather than snap: the map grows chunk by chunk and
+                        // a camera that jumps on every new one is unwatchable.
+                        scene.ortho_span += ((float)span - scene.ortho_span) * 0.08f;
+                    }
+                    scene.ortho_pan = (Vector3){ 0, 0, 0 };
+                    scene.chase_distance = scene.ortho_span * 0.9f;
+                }
+            }
             scene_update_camera(&scene, cam_target, vehicles[selected].rotation);
         }
 
@@ -1314,6 +1638,13 @@ int main(int argc, char *argv[]) {
 
             BeginMode3D(scene.camera);
                 scene_draw(&scene);
+
+                // The shared map goes down before the vehicles so translucent
+                // free space does not wash the models out.
+                if (map_render_ready)
+                    map_render_draw(&map_render, &map_session, scene.camera, scene.theme);
+                if (map_ready)
+                    quality_overlay_draw_3d(&map_session, &quality_opts, selected, scene.theme);
                 if (vehicle_count > 60) {
                     draw_density_heatmap(vehicles, vehicle_count, scene.theme);
                     // rlgl has no RL_POINTS primitive; DrawPoint3D is raylib's
@@ -1572,10 +1903,41 @@ int main(int argc, char *argv[]) {
                                   scene.theme, GetScreenWidth(), GetScreenHeight());
             }
 
+            // Map HUD. At swarm scale the map is the point and per-vehicle
+            // detail is not, so the panel collapses to one line above 16.
+            if (map_ready) {
+                const int sw2 = GetScreenWidth(), sh2 = GetScreenHeight();
+                if (show_map_panel && vehicle_count <= 16) {
+                    const int pw = 232;
+                    int py = 96;
+                    py += map_hud_draw_panel(&map_session, &map_render, sw2 - pw - 12, py,
+                                             pw, hud.font_value, scene.theme) + 8;
+                    quality_overlay_draw_panel(&map_session, &quality_opts, selected,
+                                               sw2 - pw - 12, py, pw, hud.font_value,
+                                               scene.theme);
+                } else if (show_map_panel) {
+                    map_hud_draw_compact(&map_session, &map_render, 12, sh2 - 96,
+                                         hud.font_value);
+                }
+                if (map_hud_opts.show_timeline) {
+                    const int th = (int)map_hud_opts.timeline_height;
+                    map_hud_draw_timeline(&map_session, 12, sh2 - th - 12,
+                                          sw2 - 24, th, hud.font_value, scene.theme);
+                }
+            }
+
         EndDrawing();
+
+        // After the present, so what is recorded is exactly the frame that was
+        // shown -- there is no second offscreen path that could drift from it.
+        if (capture_tick(&capture)) break;
     }
 
+    capture_finish(&capture);
+
     // Cleanup
+    if (map_render_ready) map_render_free(&map_render);
+    if (map_ready) map_session_free(&map_session);
     ortho_panel_cleanup(&ortho);
     hud_cleanup(&hud);
     for (int i = 0; i < vehicle_count; i++) {

@@ -47,7 +47,18 @@ typedef struct {
     bool global_position_valid; // GLOBAL_POSITION_INT received
     bool sender_known;           // true once we've seen a packet
     uint8_t sender_addr[16];     // sockaddr_in stored as opaque bytes
+
+    // Every parsed frame is handed on verbatim, with the wall-clock arrival
+    // time. The shared map and the tlog recorder both hang off this; neither
+    // needs the receiver to know what they do with it.
+    void  *frame_user;
+    void (*on_frame)(void *user, const void *mavlink_msg,
+                     const uint8_t *raw, uint16_t raw_len, int64_t arrival_unix_ns);
+    double last_timesync_s;      // when we last asked for a round trip
 } mavlink_receiver_t;
+
+// UNIX nanoseconds, for stamping arrivals and aligning against vehicle clocks.
+int64_t mavlink_receiver_unix_ns(void);
 
 // Initialize UDP socket on given port with MAVLink parse channel. Returns 0 on success.
 int mavlink_receiver_init(mavlink_receiver_t *recv, uint16_t port, uint8_t channel);

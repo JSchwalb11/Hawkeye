@@ -4,16 +4,41 @@ project(hawkeye C)
 set(CMAKE_C_STANDARD 11)
 
 option(BUILD_TESTING "Build tests" OFF)
+set(HAWKEYE_FIXTURE_FIREHOSE_SCALE "1" CACHE STRING
+    "Vehicle-count multiplier for the firehose fixture")
+
+# Release builds target generic hardware on purpose: -march=native would make
+# the binary faster on the machine that built it and illegal on the next one.
+if(NOT MSVC)
+    set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+endif()
 
 # MAVLink c_library_v2 (header-only, submodule)
 set(MAVLINK_DIR ${CMAKE_SOURCE_DIR}/lib/c_library_v2)
 
-# Core library: ULog parser + replay (no raylib dependency)
+# Core library: log parsing, the shared fleet map, and everything that has to
+# work without a window. Keeping the map here is what lets the fixtures score it
+# in CI with no GPU and no live process.
 add_library(hawkeye-core STATIC
     src/ulog_parser.c
     src/ulog_replay.c
     src/ulog_replay_apply.c
     src/data_source_ulog.c
+    src/geo.c
+    src/timebase.c
+    src/octomap.c
+    src/ray_transform.c
+    src/fleet_frame.c
+    src/map_ingest.c
+    src/timeline.c
+    src/quality.c
+    src/map_session.c
+    src/mavlink_map_decode.c
+    src/tlog.c
+    src/data_source_tlog.c
+    src/dataflash.c
+    src/data_source_bin.c
+    src/skynet_manifest.c
 )
 target_include_directories(hawkeye-core PUBLIC src/)
 target_include_directories(hawkeye-core PRIVATE
@@ -58,6 +83,11 @@ if(NOT BUILD_TESTING_ONLY)
         src/theme.c
         src/tactical_hud.c
         src/hud_annunciators.c
+        src/map_render.c
+        src/map_hud.c
+        src/quality_overlay.c
+        src/capture.c
+        src/gif.c
     )
 
     target_include_directories(hawkeye PRIVATE
@@ -133,4 +163,5 @@ endif()
 if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(tests)
+    add_subdirectory(test)
 endif()

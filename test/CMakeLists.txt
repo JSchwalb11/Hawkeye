@@ -1,0 +1,130 @@
+# Synthetic ray injectors and their scored checkers.
+#
+# Nothing here is ever linked into the viewer. The injectors emit over the wire
+# like any vehicle, so the tests exercise the real ingest path instead of
+# reaching around it into the map API.
+
+set(FIXTURE_WORKDIR ${CMAKE_CURRENT_BINARY_DIR}/fixture-runs)
+
+add_library(hawkeye-fixture-support STATIC
+    geom.c
+    truth.c
+    orientation_basis.c
+    canvas.c
+    ortho_render.c
+    splat.c
+    trimesh.c
+)
+target_include_directories(hawkeye-fixture-support PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_include_directories(hawkeye-fixture-support PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+if(UNIX AND NOT APPLE)
+    target_link_libraries(hawkeye-fixture-support PUBLIC m)
+endif()
+
+add_executable(ray_injector ray_injector.c)
+target_link_libraries(ray_injector PRIVATE hawkeye-fixture-support hawkeye-core)
+target_include_directories(ray_injector PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${MAVLINK_DIR} ${MAVLINK_DIR}/common)
+target_compile_definitions(ray_injector PRIVATE MAVLINK_COMM_NUM_BUFFERS=256)
+if(WIN32)
+    target_link_libraries(ray_injector PRIVATE ws2_32)
+endif()
+
+# gif.c is plain C with no raylib in it, so the checker can write a GIF of the
+# map filling in without a window or a GPU.
+add_executable(map_checker map_checker.c ${CMAKE_SOURCE_DIR}/src/gif.c)
+target_link_libraries(map_checker PRIVATE hawkeye-fixture-support hawkeye-core)
+target_include_directories(map_checker PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${MAVLINK_DIR} ${MAVLINK_DIR}/common)
+target_compile_definitions(map_checker PRIVATE MAVLINK_COMM_NUM_BUFFERS=256)
+if(WIN32)
+    target_link_libraries(map_checker PRIVATE ws2_32)
+endif()
+
+# Each fixture isolates one failure mode. Scale trims the two heavy ones on
+# machines where CI time matters; the durations they assert on are unchanged.
+set(HAWKEYE_FIXTURES
+    empty
+    ground
+    wall
+    corridor
+    orientations
+    moving
+    two-origins
+    disagreement
+    clocks
+    vanishing
+    cone
+    weak
+    firehose
+    endurance
+    cooperative
+    statue-solo
+    statue-fleet
+    statue-precision
+)
+
+# The statue fixtures range against a Gaussian splat rather than against
+# planes, so they need the asset. Everything else ignores it.
+set(STATUE_SPLAT ${CMAKE_SOURCE_DIR}/assets/statue_of_liberty.splat)
+# The exact triangles the splats were sampled from. A splat cloud cannot verify
+# a map to a finer tolerance than its own 34 cm splat spacing, so the precision
+# fixture ranges against these and scores against them.
+set(STATUE_MESH ${CMAKE_SOURCE_DIR}/assets/statue_of_liberty.tri)
+
+foreach(fixture ${HAWKEYE_FIXTURES})
+    set(fixture_scale 1)
+    if(fixture STREQUAL "firehose")
+        set(fixture_scale ${HAWKEYE_FIXTURE_FIREHOSE_SCALE})
+    endif()
+    set(fixture_splat "")
+    set(fixture_mesh "")
+    if(fixture MATCHES "^statue-")
+        set(fixture_splat ${STATUE_SPLAT})
+        set(fixture_mesh ${STATUE_MESH})
+    endif()
+    add_test(NAME fixture_${fixture}
+        COMMAND ${CMAKE_COMMAND}
+            -DINJECTOR=$<TARGET_FILE:ray_injector>
+            -DCHECKER=$<TARGET_FILE:map_checker>
+            -DFIXTURE=${fixture}
+            -DSCALE=${fixture_scale}
+            -DSPLAT=${fixture_splat}
+            -DMESH=${fixture_mesh}
+            -DWORKDIR=${FIXTURE_WORKDIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/run_fixture.cmake)
+    set_tests_properties(fixture_${fixture} PROPERTIES TIMEOUT 600)
+endforeach()
+
+# The wire path, once. Everything else replays from a recorded tlog with no
+# live process, which is what keeps CI free of timing flake.
+if(UNIX)
+    add_test(NAME fixture_wire_smoke
+        COMMAND ${CMAKE_COMMAND}
+            -DINJECTOR=$<TARGET_FILE:ray_injector>
+            -DCHECKER=$<TARGET_FILE:map_checker>
+            -DFIXTURE=ground
+            -DPORT=19488
+            -DWORKDIR=${FIXTURE_WORKDIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/run_wire_fixture.cmake)
+    set_tests_properties(fixture_wire_smoke PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
+# The viewer must not be able to tell a synthetic ray from a lidar.
+add_executable(test_no_fixture_symbols test_no_fixture_symbols.c)
+target_compile_definitions(test_no_fixture_symbols PRIVATE SRC_DIR="${CMAKE_SOURCE_DIR}/src")
+add_test(NAME no_fixture_symbols COMMAND test_no_fixture_symbols)
+
+# Behaviours no scored fixture can reach: which of two origin messages wins,
+# what a negative increment means, whether an unknown mount produces a ray.
+add_executable(test_map_units test_map_units.c)
+target_link_libraries(test_map_units PRIVATE hawkeye-fixture-support hawkeye-core)
+target_include_directories(test_map_units PRIVATE
+    ${CMAKE_SOURCE_DIR}/src ${MAVLINK_DIR} ${MAVLINK_DIR}/common)
+target_compile_definitions(test_map_units PRIVATE MAVLINK_COMM_NUM_BUFFERS=256)
+if(WIN32)
+    target_link_libraries(test_map_units PRIVATE ws2_32)
+endif()
+add_test(NAME map_units COMMAND test_map_units)
+set_tests_properties(map_units PROPERTIES
+    WORKING_DIRECTORY ${FIXTURE_WORKDIR} TIMEOUT 300)

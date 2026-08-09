@@ -63,6 +63,10 @@ typedef struct {
     bool free_track;         // free cam tracks vehicle until WASDQE detaches
     Vector3 ortho_pan;       // pan offset in world units (right-click drag)
     const theme_t *theme;    // active color theme (set from view_mode)
+    // Set by the caller when an overlay widget owns the pointer this frame.
+    // Without it, grabbing the timeline to scrub also orbits the camera --
+    // the same button drives both, and the camera has no notion of UI focus.
+    bool ui_pointer_captured;
 } scene_t;
 
 // Initialize scene (ground plane, sky, camera, lighting).

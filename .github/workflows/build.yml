@@ -65,6 +65,29 @@ jobs:
       - name: Build & test
         run: make test-core
 
+  fixtures:
+    name: Fleet map fixtures (scored)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          lfs: true
+
+      # Every fixture records its own tlog and ground truth, then replays that.
+      # No live process, no GPU, and no timing flake.
+      - name: Build & score
+        run: make fixtures
+
+      - name: Upload rendered maps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fleet-map-renders
+          path: build/test/fixture-runs/*.png
+          if-no-files-found: ignore
+
   sanitizers:
     name: ASan + UBSan
     runs-on: ubuntu-latest

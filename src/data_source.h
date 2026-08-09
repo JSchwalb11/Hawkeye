@@ -38,6 +38,12 @@ typedef struct {
 
 typedef struct data_source data_source_t;
 
+// Optional shared-map attachment. A source that can produce MAVLink frames (or
+// decoded ranging observations) pushes them here as well as into `state`, which
+// is what lets live, tlog, ULog and DataFlash all build one fleet map without
+// four different code paths.
+struct map_session;
+
 // Vtable for polymorphic data sources
 typedef struct {
     void (*poll)(data_source_t *ds, float dt);
@@ -61,9 +67,24 @@ struct data_source {
     // Replay controls (ignored by MAVLink backend)
     playback_state_t playback;
 
+    // Shared fleet map. NULL when map building is disabled.
+    struct map_session *map;
+    int map_slot;              // vehicle slot, or -1 to resolve from sysid
+
+    // Time alignment for this source, mirrored out for the UI. An unlabelled
+    // alignment guess is a lie a viewer tells quietly, so the provenance
+    // travels with the offset.
+    int      time_provenance;  // time_provenance_t
+    int64_t  time_offset_ns;
+
     // Backend-specific opaque data
     void *impl;
 };
+
+static inline void data_source_attach_map(data_source_t *ds, struct map_session *ms, int slot) {
+    ds->map = ms;
+    ds->map_slot = slot;
+}
 
 static inline void data_source_poll(data_source_t *ds, float dt) {
     ds->ops->poll(ds, dt);
@@ -86,6 +107,22 @@ int data_source_mavlink_create(data_source_t *ds, uint16_t port, uint8_t channel
 
 // Create a ULog replay data source. Returns 0 on success.
 int data_source_ulog_create(data_source_t *ds, const char *filepath);
+
+// Create a tlog replay data source. `ms` may be NULL to skip map building.
+// `channel` must be unique among concurrently open MAVLink parsers.
+int data_source_tlog_create(data_source_t *ds, const char *path,
+                            struct map_session *ms, int slot, uint8_t channel);
+uint64_t data_source_tlog_rays(const data_source_t *ds);
+uint64_t data_source_tlog_frames(const data_source_t *ds);
+
+// Create an ArduPilot DataFlash (.bin) replay data source.
+int data_source_bin_create(data_source_t *ds, const char *path,
+                           struct map_session *ms, int slot);
+uint64_t data_source_bin_rays(const data_source_t *ds);
+
+// Record every frame a live source receives into a tlog. Passing NULL stops
+// recording. Only the MAVLink backend implements this.
+int data_source_mavlink_record(data_source_t *ds, const char *tlog_path);
 
 // Return short display name for a PX4 nav_state value.
 const char *ulog_nav_state_name(uint8_t nav_state);
