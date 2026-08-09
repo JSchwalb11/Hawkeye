@@ -4,6 +4,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #define OM_NODES_PER_BLOCK 8
 #define OM_INITIAL_NODES   (1u << 16)
 #define OM_CHUNK_INITIAL   1024
@@ -347,8 +351,14 @@ void octomap_clear(octomap_t *m) {
 
 // ---------------------------------------------------------------- update
 
+// `shield` says this evidence is strong enough to earn the post-return grace
+// period. Only a beam's own boresight return does: the off-axis samples of a
+// spread hit are deliberately weaker evidence, and letting each of them shield
+// its cell for a second would immunise the whole footprint on the strength of
+// one reading. Measured on the cone fixture, shielding the whole cap took
+// false-occupied from 0.031 to 0.102.
 static void node_apply(octomap_t *m, uint32_t idx, int delta, uint8_t vehicle_id,
-                       uint32_t time_ms) {
+                       uint32_t time_ms, bool shield) {
     om_node_t *n = &m->nodes[idx];
     const uint32_t bit = om_vehicle_bit(vehicle_id);
 
@@ -429,7 +439,7 @@ static void node_apply(octomap_t *m, uint32_t idx, int delta, uint8_t vehicle_id
     // resets and still carves away to free, which is what `vanishing` checks.
     if (delta > 0) {
         if (n->log_odds < 0) n->log_odds = 0;
-        n->flags |= OM_FLAG_FRESH_HIT;
+        if (shield) n->flags |= OM_FLAG_FRESH_HIT;
     }
 
     int lo = (int)n->log_odds + delta;
@@ -484,7 +494,8 @@ static void mark_dirty_at(octomap_t *m, double x, double y, double z, int depth)
 // Apply evidence at a point, descending to `target_depth`. Occupied evidence
 // always resolves to the target; free evidence only splits confident occupancy.
 static void apply_point(octomap_t *m, const double p[3], int target_depth,
-                        int delta, uint8_t vehicle_id, uint32_t time_ms) {
+                        int delta, uint8_t vehicle_id, uint32_t time_ms,
+                        bool shield) {
     if (fabs(p[0]) >= m->root_half || fabs(p[1]) >= m->root_half ||
         fabs(p[2]) >= m->root_half) return;
 
@@ -516,7 +527,7 @@ static void apply_point(octomap_t *m, const double p[3], int target_depth,
         depth++;
     }
 
-    node_apply(m, idx, delta, vehicle_id, time_ms);
+    node_apply(m, idx, delta, vehicle_id, time_ms, shield);
     mark_dirty_at(m, p[0], p[1], p[2], depth);
 }
 
@@ -527,6 +538,7 @@ typedef struct {
     double d[3];     // unit direction
     double inv[3];
     double len;      // metres from o to the endpoint
+    double tan_half; // beam half-angle tangent; 0 carves the bare axis
 } carve_ray_t;
 
 static bool slab_clip(const carve_ray_t *r, const double lo[3], const double hi[3],
@@ -579,7 +591,7 @@ static void carve_rec(octomap_t *m, uint32_t idx, int depth,
 
     if (!m->nodes[idx].children) {
         if (depth >= want) {
-            node_apply(m, idx, delta, vehicle_id, time_ms);
+            node_apply(m, idx, delta, vehicle_id, time_ms, false);
             if (!marked) m->all_dirty = true;
             return;
         }
@@ -594,7 +606,7 @@ static void carve_rec(octomap_t *m, uint32_t idx, int depth,
         if (!node_subdivide(m, idx)) {
             // Refused at the memory cap: apply here rather than lose the ray,
             // and let the refusal counter say what happened.
-            node_apply(m, idx, delta, vehicle_id, time_ms);
+            node_apply(m, idx, delta, vehicle_id, time_ms, false);
             if (!marked) m->all_dirty = true;
             return;
         }
@@ -605,8 +617,26 @@ static void carve_rec(octomap_t *m, uint32_t idx, int depth,
     for (int i = 0; i < OM_NODES_PER_BLOCK; i++) {
         double cc[3];
         child_center(i, cx, cy, cz, quarter, cc);
-        const double lo[3] = { cc[0] - quarter, cc[1] - quarter, cc[2] - quarter };
-        const double hi[3] = { cc[0] + quarter, cc[1] + quarter, cc[2] + quarter };
+        // The beam is a cone, and the sensor's reading covers all of it, so the
+        // swept region is the axis grown by the cone radius. Inflating the box
+        // and clipping the axis against it is the cheap way to get that, but the
+        // inflation is a cube: it widens the sweep laterally *and* extends it a
+        // radius further along the beam, which is why the caller has to pull the
+        // axial stop back by the same amount. The radius is taken at each
+        // child's own position on the axis -- reusing the parent's far-end
+        // figure inflates every child to the widest point of the parent and
+        // over-carves measurably.
+        double rad = 0.0;
+        if (r->tan_half > 0.0) {
+            double t = (cc[0] - r->o[0]) * r->d[0]
+                     + (cc[1] - r->o[1]) * r->d[1]
+                     + (cc[2] - r->o[2]) * r->d[2];
+            if (t < t_enter) t = t_enter;
+            if (t > t_exit)  t = t_exit;
+            rad = r->tan_half * t;
+        }
+        const double lo[3] = { cc[0] - quarter - rad, cc[1] - quarter - rad, cc[2] - quarter - rad };
+        const double hi[3] = { cc[0] + quarter + rad, cc[1] + quarter + rad, cc[2] + quarter + rad };
         double a = t_enter, b = t_exit;
         if (!slab_clip(r, lo, hi, &a, &b)) continue;
         if (b <= a) continue;
@@ -621,6 +651,93 @@ static int scale_delta(int base, float weight) {
     int d = (int)lrintf((float)base * weight);
     if (d == 0) d = (base > 0) ? 1 : -1;   // a weak return still counts for something
     return d;
+}
+
+// --- the occupied half of the cone model --------------------------------
+//
+// A proximity sensor reports the nearest surface *somewhere* in its cone, so a
+// return at range R says "one of the cells on the R cap is occupied" -- a
+// disjunction, which an occupancy grid has no way to hold. Marking the axis
+// cell alone picks one disjunct and commits to it, and that is the half of the
+// model the carve was missing: cone-wide free against point-wide occupied
+// erodes any surface whose beam footprint is larger than a leaf.
+//
+// Every cap sample gets evidence scaled by its angle off the boresight, and
+// the scaling is *not* normalised across the cap -- the log-odds grid treats
+// cells as independent, and each cell's share is a statement about that cell,
+// not a slice of a fixed cake. Sharing one return's increment out instead was
+// measured: statue-solo shape recall collapses to 0.540 because almost no cell
+// ever reaches the occupied threshold. What makes the surface sharp is not
+// which cell gets the most from one return, it is that repeated looks from
+// different bearings only agree where the surface actually is.
+//
+// It costs nodes, and that is the binding constraint rather than accuracy:
+// spreading two octree levels below the footprint scores better on every
+// statue metric and takes `endurance` to 83,697 live nodes against a 60,000
+// ceiling. One level below fits.
+
+#define OM_CONE_RINGS   2    // sample rings between the axis and the cone edge
+#define OM_CONE_LEVELS  1    // octree levels below the footprint to spread over
+#define OM_CONE_SAMPLES 16   // 1 + sum of round(2*pi*(k-0.5)) over the rings
+
+// Sample the range-R cap and give each sample its own share of the return.
+static void apply_cone_hit(octomap_t *m, const om_ray_t *ray, const double d[3],
+                           double len, double cone_r, int depth, int total) {
+    // Any perpendicular pair spans the cap; the beam has no roll to preserve.
+    double u[3], v[3];
+    {
+        const double ax = fabs(d[0]), ay = fabs(d[1]), az = fabs(d[2]);
+        double seed[3] = { 0.0, 0.0, 0.0 };
+        if (ax <= ay && ax <= az) seed[0] = 1.0;
+        else if (ay <= az)        seed[1] = 1.0;
+        else                      seed[2] = 1.0;
+        u[0] = seed[1] * d[2] - seed[2] * d[1];
+        u[1] = seed[2] * d[0] - seed[0] * d[2];
+        u[2] = seed[0] * d[1] - seed[1] * d[0];
+        const double n = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+        if (!(n > 1e-9)) return;
+        u[0] /= n; u[1] /= n; u[2] /= n;
+        v[0] = d[1] * u[2] - d[2] * u[1];
+        v[1] = d[2] * u[0] - d[0] * u[2];
+        v[2] = d[0] * u[1] - d[1] * u[0];
+    }
+
+    int emitted = 0;
+    for (int k = 0; k <= OM_CONE_RINGS; k++) {
+        // Ring k sits at the middle of its annulus and carries a sample count
+        // proportional to that annulus's area, so the cap is covered evenly and
+        // the weight below describes sensitivity rather than sample density.
+        const double frac = (k == 0) ? 0.0 : ((double)k - 0.5) / (double)OM_CONE_RINGS;
+        const double off = frac * cone_r;
+        int count = (k == 0) ? 1 : (int)lround(2.0 * M_PI * ((double)k - 0.5));
+        if (count < 1) count = 1;
+        // A return from further off the boresight is weaker, so the evidence
+        // for it is weaker: quadratic falloff to nothing at the nominal cone
+        // edge, which is the usual response curve for a beam this wide.
+        const int share = (int)lround((double)total * (1.0 - frac * frac));
+        if (share <= 0) continue;
+        for (int j = 0; j < count && emitted < OM_CONE_SAMPLES; j++, emitted++) {
+            const double phi = 2.0 * M_PI * (double)j / (double)count;
+            const double e[3] = {
+                u[0] * cos(phi) + v[0] * sin(phi),
+                u[1] * cos(phi) + v[1] * sin(phi),
+                u[2] * cos(phi) + v[2] * sin(phi),
+            };
+            // The locus of "something at range R" is the cap, not a flat disc.
+            // A disc sample is nearer than R and lands inside the volume this
+            // same ray has just carved free.
+            const double dir[3] = {
+                d[0] + e[0] * off / len,
+                d[1] + e[1] * off / len,
+                d[2] + e[2] * off / len,
+            };
+            const double dn = sqrt(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+            double p[3];
+            for (int a = 0; a < 3; a++) p[a] = ray->origin[a] + len * dir[a] / dn;
+            apply_point(m, p, depth, share, ray->vehicle_id, ray->time_ms,
+                        k == 0);
+        }
+    }
 }
 
 void octomap_insert_ray(octomap_t *m, const om_ray_t *ray) {
@@ -642,11 +759,13 @@ void octomap_insert_ray(octomap_t *m, const om_ray_t *ray) {
     // The cell the hit will own has to be decided before carving, because the
     // carve must stop short of exactly that cell. Widen the endpoint with the
     // sensor cone: a 25-degree sonar at 10 m is not a laser, and drawing it as
-    // one invents detail the sensor never had.
+    // one invents detail the sensor never had. A no-return has no endpoint to
+    // widen but the same resolution limit applies to what it clears, so the
+    // width bounds its carve too.
+    const double cone_r = (double)ray->cone_radius_m;
     int hit_depth = m->max_depth;
-    if (ray->hit && ray->cone_radius_m > 0.0f) {
-        const double want = (double)ray->cone_radius_m * 2.0;
-        hit_depth = octomap_depth_for_size(m, want);
+    if (cone_r > 0.0) {
+        hit_depth = octomap_depth_for_size(m, cone_r * 2.0);
         if (hit_depth > m->max_depth) hit_depth = m->max_depth;
         if (hit_depth < m->coarse_depth) hit_depth = m->coarse_depth;
     }
@@ -656,14 +775,23 @@ void octomap_insert_ray(octomap_t *m, const om_ray_t *ray) {
     // Stop short by a full hit cell, not half a leaf. Reaching into the cell
     // the hit is about to claim debits every hit by a miss, which is how a
     // surface observed once ends up never crossing the occupied threshold.
+    //
+    // A cone carve has to come back a further cone radius on top of that. The
+    // inflated boxes it clips against are cubes, so the swept region runs a
+    // radius past wherever the axis stops -- straight through the surface the
+    // sensor just ranged. Measured on `cone`, a flat wall head-on: the axial
+    // term alone costs 36% of the surface while the cells that survive sit at
+    // 0.0000 m RMS, which is exactly what a sweep that is laterally right and
+    // axially long looks like.
     const double hit_cell = octomap_cell_size(m, hit_depth);
-    double t_end = len - (ray->hit ? hit_cell : 0.0);
+    double t_end = len - cone_r - (ray->hit ? hit_cell : 0.0);
     if (t_end > t_start) {
         carve_ray_t r;
         memcpy(r.o, ray->origin, sizeof(r.o));
         memcpy(r.d, d, sizeof(r.d));
         for (int a = 0; a < 3; a++) r.inv[a] = (d[a] != 0.0) ? 1.0 / d[a] : 0.0;
         r.len = len;
+        r.tan_half = cone_r / len;
 
         const double lo[3] = { -m->root_half, -m->root_half, -m->root_half };
         const double hi[3] = {  m->root_half,  m->root_half,  m->root_half };
@@ -677,8 +805,19 @@ void octomap_insert_ray(octomap_t *m, const om_ray_t *ray) {
 
     if (!ray->hit) return;   // a max-range reading is "no return", not a wall
 
-    apply_point(m, ray->endpoint, hit_depth,
-                scale_delta(m->lo_hit, ray->weight), ray->vehicle_id, ray->time_ms);
+    const int hit_delta = scale_delta(m->lo_hit, ray->weight);
+    if (cone_r <= 0.0) {
+        apply_point(m, ray->endpoint, hit_depth, hit_delta, ray->vehicle_id,
+                    ray->time_ms, true);
+        return;
+    }
+
+    // The spread has to resolve finer than the footprint or there is nothing to
+    // spread over: `hit_depth` sizes a cell to the whole cone, so every sample
+    // would land back in the one cell the axis already owned.
+    int spread_depth = hit_depth + OM_CONE_LEVELS;
+    if (spread_depth > m->max_depth) spread_depth = m->max_depth;
+    apply_cone_hit(m, ray, d, len, cone_r, spread_depth, hit_delta);
 }
 
 void octomap_insert_batch(octomap_t *m, const om_ray_t *rays, int count) {

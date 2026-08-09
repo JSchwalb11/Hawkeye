@@ -214,9 +214,11 @@ bool rt_build_ray(const ray_obs_t *obs, om_ray_t *out) {
     out->endpoint[2] = obs->origin_enu[2] + enu[2];
     out->hit = hit;
     out->weight = rt_evidence_weight(obs->covariance_cm2, obs->signal_quality);
-    out->cone_radius_m = hit
-        ? rt_cone_radius(range, obs->horizontal_fov_rad, obs->vertical_fov_rad)
-        : 0.0f;
+    // A no-return sweeps its whole cone clear, not just the axis, so the width
+    // is as load-bearing here as it is on a hit -- zeroing it would carve a
+    // pencil through a volume the sensor cleared to its full beam width.
+    out->cone_radius_m = rt_cone_radius(range, obs->horizontal_fov_rad,
+                                        obs->vertical_fov_rad);
     out->vehicle_id = obs->vehicle_id;
     out->time_ms = obs->time_ms;
     return true;
@@ -279,7 +281,8 @@ int rt_expand_obstacle_distance(const obstacle_obs_t *obs, om_ray_t *out, int ma
         r->hit = hit;
         r->weight = 1.0f;
         // A sector spans `increment` degrees of azimuth; treat that as the cone.
-        r->cone_radius_m = hit ? rt_cone_radius(range, increment * RT_DEG2RAD, 0.0f) : 0.0f;
+        // Set on a no-return too: that sector is clear to its full width.
+        r->cone_radius_m = rt_cone_radius(range, increment * RT_DEG2RAD, 0.0f);
         r->vehicle_id = obs->vehicle_id;
         r->time_ms = obs->time_ms;
     }
