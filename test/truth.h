@@ -59,6 +59,14 @@ typedef struct {
     // than the resulting rays/s means the check has the same teeth on a slow CI
     // runner as on a fast workstation. 0 = unchecked.
     int64_t prune_passes_max;
+    // Sub-voxel surface placement. `gain` is centre-to-surface RMS over
+    // offset-to-surface RMS on the same cells, so 1.0 is "the offset bought
+    // nothing"; `share` is the fraction of scored occupied cells carrying an
+    // estimate at all, which is what catches a prune or a subdivision quietly
+    // dropping it. Both are only meaningful where the cell is larger than the
+    // sensor's own error, so only the precision fixture sets them.
+    double  surface_place_gain_min;
+    double  surface_place_share_min;
     double  min_rays_per_s;        // 0 = unchecked
     int     require_drops;         // 1 = drops must be non-zero and reported
     double  contested_max_dist_m;  // contested cells must sit within this of the offset band

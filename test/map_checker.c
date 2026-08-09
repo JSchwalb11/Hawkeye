@@ -72,6 +72,16 @@ typedef struct {
     double   err_sq_sum;
     uint64_t err_n;
     double   err_max;
+    // Surface *placement*, scored without the size credit `surface_rms` gives.
+    // That credit is right for asking "is the map wrong about this cell" -- a
+    // coarse cone-widened cell should not be punished for being big -- and it
+    // is exactly what hides a sub-voxel offset, because a cell whose centre is
+    // within half an edge of the surface already scores zero. These two are
+    // the same points measured the same way, differing only in whether the
+    // map is asked where the cell is or where the surface in it is.
+    double   place_ctr_sq, place_surf_sq;
+    uint64_t place_n;
+    uint64_t place_have_surf;
     uint64_t false_occupied;
 
     uint64_t contested_cells;
@@ -124,6 +134,16 @@ static void scan_leaf(const om_leaf_t *leaf, void *user) {
         s->err_n++;
         if (err > s->err_max) s->err_max = err;
         if (err > SURFACE_SLACK_M) s->false_occupied++;
+
+        double sp[3];
+        om_node_surface(leaf->node, leaf->center, leaf->size, sp);
+        const double ds = world_distance(s->world, s->final_t_s, sp);
+        if (ds < 1e17) {
+            s->place_ctr_sq  += d * d;
+            s->place_surf_sq += ds * ds;
+            s->place_n++;
+            if (leaf->node->flags & OM_FLAG_HAS_SURFACE) s->place_have_surf++;
+        }
     } else {
         // No geometry at all: every occupied cell is a false positive.
         s->false_occupied++;
@@ -166,6 +186,10 @@ static double wall_now(void) {
 typedef struct {
     double   surface_rms;
     double   surface_max;
+    double   place_ctr_rms;    // cell centre to the true surface, no size credit
+    double   place_surf_rms;   // the cell's own surface estimate, same points
+    double   place_surf_share; // fraction of those cells carrying an estimate
+    uint64_t place_n_any;      // scored cells; 0 means the fixture has no geometry
     double   false_occupied_rate;
     double   false_free_rate;
     double   coverage;
@@ -520,6 +544,11 @@ static void measure(map_session_t *ms, const truth_t *t, const world_t *w,
     rep->vanished_occupied = s.vanished_occupied;
     rep->surface_rms = s.err_n ? sqrt(s.err_sq_sum / (double)s.err_n) : 0.0;
     rep->surface_max = s.err_max;
+    rep->place_ctr_rms  = s.place_n ? sqrt(s.place_ctr_sq  / (double)s.place_n) : 0.0;
+    rep->place_surf_rms = s.place_n ? sqrt(s.place_surf_sq / (double)s.place_n) : 0.0;
+    rep->place_surf_share = s.place_n
+        ? (double)s.place_have_surf / (double)s.place_n : 0.0;
+    rep->place_n_any = s.place_n;
     rep->false_occupied_rate = s.occupied_cells
         ? (double)s.false_occupied / (double)s.occupied_cells : 0.0;
 
@@ -889,6 +918,23 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
         bad += fail("blocks pruned", (double)r->prunes_total, "<",
                     (double)th->prune_blocks_min);
 
+    // Sub-voxel placement. The gain is asserted rather than the absolute RMS
+    // because the absolute figure is the sensor's, not the map's -- what the
+    // map is responsible for is not throwing the remainder away. The share
+    // guards the paths that could silently drop it: a subdivision that seeded
+    // children with a surface outside their own bounds, or a prune that
+    // collapsed eight cells and kept none of theirs.
+    if (th->surface_place_gain_min > 0.0 && r->place_n_any) {
+        const double gain = r->place_surf_rms > 0.0
+            ? r->place_ctr_rms / r->place_surf_rms : 0.0;
+        if (gain < th->surface_place_gain_min)
+            bad += fail("surface placement gain", gain, "<", th->surface_place_gain_min);
+    }
+    if (th->surface_place_share_min > 0.0 && r->place_n_any &&
+        r->place_surf_share < th->surface_place_share_min)
+        bad += fail("cells with a surface estimate", r->place_surf_share, "<",
+                    th->surface_place_share_min);
+
     // Memory must plateau, not climb. Live node count is the honest measure:
     // the byte figure only moves when the pool doubles, so a map that grows
     // steadily could sit at the same byte total for a long while.
@@ -912,6 +958,11 @@ static void print_report(const truth_t *t, const report_t *r) {
            t->header.fixture, t->header.vehicle_count,
            t->header.vehicle_count == 1 ? "" : "s", t->header.duration_s, t->ray_count);
     printf("  surface RMS            %.4f m  (max %.4f m)\n", r->surface_rms, r->surface_max);
+    if (r->place_n_any)
+        printf("  surface placement      %.4f m centre -> %.4f m offset"
+               "  (%.1f%% of cells, %.2fx)\n",
+               r->place_ctr_rms, r->place_surf_rms, r->place_surf_share * 100.0,
+               r->place_surf_rms > 0.0 ? r->place_ctr_rms / r->place_surf_rms : 0.0);
     printf("  false-occupied rate    %.5f\n", r->false_occupied_rate);
     printf("  false-free rate        %.5f\n", r->false_free_rate);
     if (r->group_scored > 1)

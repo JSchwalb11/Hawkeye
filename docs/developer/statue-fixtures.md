@@ -278,9 +278,17 @@ claim was measured and refuted**: built on one lattice with one traversal
 against a binary control grid, the field resolves to cell/6 against the grid's
 cell/3.4 — a 1.8x linear gain, not 10x — and matching the shipped map's 3.27 mm
 needs ~15 mm voxels, where it holds 6.3x more cells at 374 MiB against 38.3 MiB
-rather than 1/125 as many. Do not do the rewrite; the accuracy that would
-justify it is available far more cheaply as a sub-voxel offset on occupied
-leaves. See [follow-ups.md](follow-ups.md).
+rather than 1/125 as many. Do not do the rewrite.
+
+The accuracy that would have justified it is now bought directly: occupied
+leaves carry a sub-voxel offset, so the map reports where in a cell the surface
+is rather than where the cell is. On this fixture that takes surface placement
+from 4.4 mm to 3.5 mm — **1.25x, not the 1.8x the spike predicted**, and the gap
+is the point. The spike measured a representation against a representation on a
+flat plane; here the offset is competing against the sensor's own error as well,
+and it can only ever recover the part that belongs to the cell. What justifies
+it is that subdividing to buy the same 3.5 mm costs four times the memory and
+does not get there. Full numbers in [follow-ups.md](follow-ups.md).
 
 Two limits are worth stating because a fixture cannot supply them:
 

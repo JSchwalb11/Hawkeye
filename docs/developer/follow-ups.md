@@ -1,8 +1,10 @@
 # Fleet map — deferred work
 
 Everything the fleet-map work left open when it merged (#2) has now been
-resolved, and two defects surfaced along the way that no fixture had reached.
-The record is below: what each turned out to be, and what guards it now.
+resolved except one item, and two defects surfaced along the way that no fixture
+had reached. The record is below: what each turned out to be, and what guards it
+now. Entries are kept after they close, with their numbers, because several of
+them closed by being disproved and the disproof is the useful part.
 
 Issues are disabled on this repository, which is why this lives in the tree
 rather than in a tracker.
@@ -24,18 +26,65 @@ mostly-`UNKNOWN` cell would render as carved and quietly overstate coverage —
 in `MAP_DRAW_COVERAGE`, the one view that exists to show what was never looked
 at. A majority-free rule plus a coverage-view check is the work.
 
-### A sub-voxel offset on occupied leaves
-
-What the TSDF spike actually recommends. The field's whole accuracy advantage
-over the binary grid measured at 1.8x linear, and it lives in sub-voxel surface
-placement — not in the free-space representation, where the octree is two orders
-of magnitude ahead. Storing an offset on occupied leaves would capture that 1.8x
-without touching the part that works. Nobody needs it until something needs
-centimetres in the field.
-
 ---
 
 # Done
+
+## A sub-voxel offset on occupied leaves
+
+**Closed**, and worth less than predicted for a reason worth recording.
+
+Each leaf now carries a three-byte offset from its own centre, a quarter-weight
+running mean of the returns landing in it, reported by `om_node_surface()`. The
+prediction from the TSDF spike was that this captures the field's 1.8x linear
+advantage. Measured on `statue-precision`, it captures **1.25x** — surface
+placement 4.4 mm from the cell centre, 3.5 mm from the offset — and 1.01–1.04x
+on every other fixture.
+
+The 1.01x is not a failure of the offset, it is the fixtures being honest: they
+all fly beams whose footprint dwarfs their leaves, so their placement error
+belongs to the sensor and no amount of representation recovers it. The offset
+can only ever recover the part of the error that is the *cell's*.
+
+**The argument that carries it is memory, not accuracy.** It costs 25% of the
+node pool — `om_node_t` goes 16 to 20 bytes, and alignment means any addition at
+all costs the full four. Against that, the alternative way to buy surface
+placement:
+
+| | node pool | centre placement | offset placement |
+| --- | --- | --- | --- |
+| 7.8 mm leaves | 128 MiB | 4.4 mm | — |
+| 7.8 mm leaves + offset | 160 MiB | 4.4 mm | **3.5 mm** |
+| 3.9 mm leaves | ~256 MiB | 3.7 mm | — |
+| 3.9 mm leaves + offset | 320 MiB | 3.7 mm | 3.5 mm |
+
+Subdivision costs four times the memory for less placement accuracy, and the
+last row says the offset has already reached the sensor's floor — the extra
+octree level buys nothing once it is there.
+
+**Things measured and discarded along the way.** The weight of the running mean
+does not matter: 1, 1/2, 1/4 and 1/8 all land between 1.24x and 1.26x, so it is
+set to a quarter on the principle that it should settle over the same span of
+evidence the occupancy does, not because a sweep chose it. Recording only the
+boresight sample rather than every cone sample is *worse* (1.08x), and scaling
+each update by the sample's own share of the return is worth about 0.01 —
+inside the noise, kept because it costs nothing and is the more defensible rule.
+
+**What guards it.** `statue-precision` asserts a placement gain of at least 1.15
+and that 99% of scored cells carry an estimate. Three unit cases in
+`test_map_units` cover what the fixture provably cannot: that the estimate beats
+the centre at all, that a prune collapsing eight cells carries their estimate
+into the parent's frame rather than dropping it, and that a subdivision does
+*not* hand the parent's estimate to all eight children — a point inside one
+child is not a point inside its seven siblings.
+
+That last group exists because the obvious fixture threshold was written first
+and then measured: reverting either the prune or the subdivide path leaves
+`statue-precision` at 1.25x and 100.0%, because the cells involved are re-hit
+immediately afterwards and re-establish their own estimates. The threshold's
+comment says so, so the next person does not assume it covers them.
+
+---
 
 ## No regression test behind the `cone_cm` width fix
 
