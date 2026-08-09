@@ -202,8 +202,13 @@ sensor able to see past an obstacle filling most of its own cone.
 
 Against a faithful sensor the pencil map fails `corridor` on two thresholds —
 surface RMS 0.9654 m against a 0.80 ceiling, false-occupied 0.4619 against 0.30
-— while the cone map passes at 0.2203 and 0.0319. Each map model passes only
+— while the cone map passes at 0.2883 and 0.0613. Each map model passes only
 against the sensor model that matches it, and the spec says which one is real.
+
+(Both columns re-measured on the merged branch from one recording, the pencil
+side via `git show 43b3513:src/octomap.c`. An earlier draft of this entry gave
+the cone map 0.2203 and 0.0319; those came from a working branch before the
+merge and do not reproduce here.)
 
 The sector's *elevation* extent is unspecified in the message, so treating it as
 a circular cone remains a modelling choice — but it is the same choice the
@@ -241,8 +246,10 @@ Pinned by `test_grazing_order`, since no scored fixture reaches this ordering.
 The one item that closed by being disproved. A voxel-hashed TSDF and a binary
 control grid were built on one lattice with one DDA traversal, so any difference
 is representational rather than an implementation artifact; the harness was
-validated by reproducing the shipped fixture to 0.00091 m against its published
-0.0009.
+validated by reproducing the shipped fixture to 0.00091 m against the 0.0009 it
+published at the time. (`statue-precision` now reports 0.0019 m — the beam model
+costs it about a millimetre. The spike's comparison is internal to itself, so
+its conclusion does not move.)
 
 | claim | verdict |
 | --- | --- |

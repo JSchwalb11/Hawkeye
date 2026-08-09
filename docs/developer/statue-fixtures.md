@@ -193,9 +193,15 @@ were sampled from, and scores against them too. `tools/bake_splat.py --tri`
 writes them; `test/trimesh.c` does Möller–Trumbore and exact point-triangle
 distance.
 
-**Result: surface RMS 0.0009 m, max error 0.0066 m, false-occupied 0.00000,
-false-free 0.0005.** Nine tenths of a millimetre, against an exact reference,
-with 99.95% of observed surface represented.
+**Result: surface RMS 0.0019 m, max error 0.0106 m, false-occupied 0.00000,
+false-free 0.00000, shape recall 1.00000.** Under two millimetres against an
+exact reference, with every observed surface voxel represented.
+
+(This read 0.0009 m before the beam model. The fixture flies a 0.09° beam, so
+its footprint at range is still sub-centimetre and the spread costs it about a
+millimetre of RMS — the price is paid here in exchange for the map agreeing
+with what a real sensor reports. It buys back the last of the false-free rate:
+0.0005 → 0.00000.)
 
 ### The erosion bug this fixture found
 
