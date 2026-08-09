@@ -470,7 +470,13 @@ static bool node_subdivide(octomap_t *m, uint32_t idx) {
         c->last_seen_ms = parent.last_seen_ms;
         c->agree = parent.agree;
         c->disagree = parent.disagree;
-        c->flags = parent.flags;
+        // The surface estimate does not descend. It names one point, and that
+        // point is inside at most one of the eight children -- copying it would
+        // hand seven of them a surface located outside their own bounds. The
+        // child that contains it gets a true one from the return that provoked
+        // the split, which is the same insertion that is on its way down here.
+        c->flags = (uint8_t)(parent.flags & ~OM_FLAG_HAS_SURFACE);
+        c->surf[0] = c->surf[1] = c->surf[2] = 0;
     }
     m->nodes[idx].children = blk;
     m->stats.subdivisions++;
@@ -493,6 +499,35 @@ static void child_center(int i, double cx, double cy, double cz, double quarter,
 static void mark_dirty_at(octomap_t *m, double x, double y, double z, int depth) {
     if (depth >= m->chunk_depth) chunk_mark_dirty(m, octomap_chunk_key(m, x, y, z));
     else m->all_dirty = true;
+}
+
+// How fast the surface estimate follows new returns. A cell reaches confident
+// occupancy in about four hits (+17 against a 70 clamp), so a quarter-weight
+// mean settles over the same span of evidence that the occupancy itself does.
+// Measured against 1, 1/2 and 1/8 -- see docs/developer/statue-fixtures.md.
+#define OM_SURF_ALPHA 0.25
+
+// Record where inside the cell the return landed. The first one is taken whole:
+// a fresh node's stored offset is zero, which is a real position (the centre)
+// rather than an absent one, so averaging against it would drag every
+// lightly-observed cell back toward the middle.
+static void node_note_surface(om_node_t *n, const double p[3],
+                              const double c[3], double half, double conf) {
+    const double to_cell = 0.5 / half;   // cell-relative, +/-0.5 across an edge
+    const bool first = !(n->flags & OM_FLAG_HAS_SURFACE);
+    const double alpha = OM_SURF_ALPHA * conf;
+    for (int a = 0; a < 3; a++) {
+        double u = (p[a] - c[a]) * to_cell;
+        if (u < -0.5) u = -0.5;
+        if (u >  0.5) u =  0.5;
+        double q = u * OM_SURF_SCALE;
+        if (!first) q = (double)n->surf[a] + (q - (double)n->surf[a]) * alpha;
+        int v = (int)lrint(q);
+        if (v >  127) v =  127;
+        if (v < -127) v = -127;
+        n->surf[a] = (int8_t)v;
+    }
+    n->flags |= OM_FLAG_HAS_SURFACE;
 }
 
 // Apply evidence at a point, descending to `target_depth`. Occupied evidence
@@ -532,6 +567,12 @@ static void apply_point(octomap_t *m, const double p[3], int target_depth,
     }
 
     node_apply(m, idx, delta, vehicle_id, time_ms, shield);
+    if (delta > 0) {
+        const double c[3] = { cx, cy, cz };
+        double conf = (double)delta / (double)m->lo_hit;
+        if (conf > 1.0) conf = 1.0;
+        node_note_surface(&m->nodes[idx], p, c, half, conf);
+    }
     mark_dirty_at(m, p[0], p[1], p[2], depth);
 }
 
@@ -895,12 +936,42 @@ static bool prune_rec(octomap_t *m, uint32_t idx, uint32_t *reclaimed) {
     if (votes >= m->contested_min_votes &&
         (int)disagree * 100 >= votes * (int)m->contested_pct) return false;
 
+    // The collapsed cell keeps a surface if its children had one, averaged in
+    // the parent's own frame: a child sits at +/-0.25 of a parent edge and is
+    // half its size, so a child offset u maps to +/-0.25 + u/2. Dropping it
+    // instead would make a prune -- a memory decision -- silently coarsen the
+    // map's accuracy, and pruning runs on a timer.
+    double surf_sum[3] = { 0.0, 0.0, 0.0 };
+    int surf_n = 0;
+    for (int i = 0; i < OM_NODES_PER_BLOCK; i++) {
+        const om_node_t *c = &m->nodes[base + (uint32_t)i];
+        if (!(c->flags & OM_FLAG_HAS_SURFACE)) continue;
+        for (int a = 0; a < 3; a++) {
+            const double child_center_u = ((i >> a) & 1) ? 0.25 : -0.25;
+            surf_sum[a] += (child_center_u + (double)c->surf[a] / OM_SURF_SCALE * 0.5)
+                         * OM_SURF_SCALE;
+        }
+        surf_n++;
+    }
+
     om_node_t *p = &m->nodes[idx];
     p->log_odds = (int8_t)(lo_sum / OM_NODES_PER_BLOCK);
     p->observers = observers;
     p->last_seen_ms = last_seen;
     p->agree = agree;
     p->disagree = disagree;
+    if (surf_n > 0) {
+        for (int a = 0; a < 3; a++) {
+            int v = (int)lrint(surf_sum[a] / (double)surf_n);
+            if (v >  127) v =  127;
+            if (v < -127) v = -127;
+            p->surf[a] = (int8_t)v;
+        }
+        p->flags |= OM_FLAG_HAS_SURFACE;
+    } else {
+        p->flags &= (uint8_t)~OM_FLAG_HAS_SURFACE;
+        p->surf[0] = p->surf[1] = p->surf[2] = 0;
+    }
     p->children = 0;
     block_free(m, base);
     m->stats.prunes++;
@@ -1102,7 +1173,11 @@ typedef struct {
 } om_snapshot_header_t;
 
 #define OM_SNAPSHOT_MAGIC   0x4F4D5031u   /* "OMP1" */
-#define OM_SNAPSHOT_VERSION 1u
+// 2: om_node_t gained the sub-voxel surface offset. A snapshot is the raw node
+// array, so the layout is the format; restoring a v1 blob into a v2 node would
+// read three bytes of the next node as an offset. Keyframes live and die inside
+// one session, so rejecting the old version costs nothing.
+#define OM_SNAPSHOT_VERSION 2u
 
 size_t octomap_snapshot_size(const octomap_t *m) {
     if (!m) return 0;

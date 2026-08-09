@@ -59,10 +59,24 @@ typedef struct {
     uint8_t  disagree;      // cross-vehicle contradiction, saturating
     // Bit 0 marks a cell whose last applied update was a range return. It is
     // what gives `hit_grace_ms` something to measure from -- see node_apply.
+    // Bit 1 marks a cell that has been told where inside itself the surface is.
     uint8_t  flags;
+    // Where in this cell the returns actually landed, in units of
+    // OM_SURF_SCALE per cell edge, relative to the centre. A cell says
+    // "occupied" but a range return knows more than that: it knows *where*.
+    // Discarding the remainder rounds every surface to the nearest cell centre
+    // and puts a floor of about a third of a cell under the map's accuracy that
+    // no amount of evidence can lift. See octomap_surface_point.
+    int8_t   surf[3];
 } om_node_t;
 
-#define OM_FLAG_FRESH_HIT 0x01
+#define OM_FLAG_FRESH_HIT   0x01
+#define OM_FLAG_HAS_SURFACE 0x02
+
+// `surf` spans the cell: -127..127 maps to -0.5..+0.5 of an edge. The quantum
+// is a cell/254, three orders below the leaf, so the storage is never the
+// limit -- the sensor is.
+#define OM_SURF_SCALE 254.0
 
 typedef enum {
     OM_UNKNOWN = 0,
@@ -200,6 +214,26 @@ static inline om_state_t om_node_state(const octomap_t *m, const om_node_t *n) {
 
 static inline uint32_t om_vehicle_bit(uint8_t vehicle_id) {
     return 1u << (vehicle_id % OM_MAX_TRACKED_VEHICLES);
+}
+
+// The map's best estimate of where the surface inside this cell is, rather than
+// where the cell is. Falls back to the centre for a cell no return ever landed
+// in -- carved-free and unknown cells have no surface to report, and neither
+// does an occupied cell that only ever inherited its evidence from a prune.
+//
+// Anything scoring or drawing a surface should ask for this instead of using
+// the cell centre. The difference is invisible where the cell is smaller than
+// the sensor's own error and worth roughly a factor of two where it is not.
+static inline void om_node_surface(const om_node_t *n, const double center[3],
+                                   double size, double out[3]) {
+    if (!(n->flags & OM_FLAG_HAS_SURFACE)) {
+        out[0] = center[0]; out[1] = center[1]; out[2] = center[2];
+        return;
+    }
+    const double s = size / OM_SURF_SCALE;
+    out[0] = center[0] + (double)n->surf[0] * s;
+    out[1] = center[1] + (double)n->surf[1] * s;
+    out[2] = center[2] + (double)n->surf[2] * s;
 }
 
 // --- Maintenance -------------------------------------------------------

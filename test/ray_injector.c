@@ -281,6 +281,25 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .false_free_max = 0.02, .surface_tol_m = 0.02,
         .coverage_min = 0.90, .occupied_cells_min = 5000, .occupied_cells_max = -1,
         .shape_voxel_m = 0.05,
+        // The only fixture that can see the sub-voxel offset, and for a reason
+        // worth stating: the gain is bounded by how much of the placement error
+        // is the cell's rather than the sensor's, and every other fixture flies
+        // a beam whose footprint dwarfs its leaves. Measured 1.25x here and
+        // 1.01-1.04x everywhere else, so a threshold anywhere but here would be
+        // asserting noise. 1.15 leaves room without leaving room for the
+        // feature to stop working.
+        .surface_place_gain_min = 1.15,
+        // Every scored cell carries an estimate, and it needs to stay that way.
+        //
+        // This does *not* guard the prune and subdivide paths, which was the
+        // first thing it was written to do -- reverting either of them was
+        // measured here and left the fixture at 1.25x and 100.0%, because the
+        // cells involved get re-hit immediately afterwards and re-establish
+        // their own estimate. Those two live in test_map_units, where the
+        // collapse can be the last thing that happens. What this catches is the
+        // wholesale case: recording stops, or stops reaching the cells that get
+        // scored.
+        .surface_place_share_min = 0.99,
     }, 0, 0, 8, true },
 
     // Inside a room, which is the one thing an exterior orbit of a standing
