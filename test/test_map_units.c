@@ -470,6 +470,206 @@ static void test_grazing_order(void) {
           "misses spread past the grace window still clear the cell");
 }
 
+// A cell is occupied, but a range return knows more than that: it knows where
+// in the cell the surface is. Dropping that remainder rounds every surface to
+// the nearest cell centre, and no amount of further evidence lifts the error
+// back off that floor -- the scored fixtures cannot see it, because their
+// surface metric gives a cell credit for its own size and a cell whose centre
+// is within half an edge of the surface already scores zero.
+//
+// The check is deliberately geometric rather than a tuned number: rays land in
+// a known corner of a known cell, and the reported surface point has to be
+// nearer to where they landed than the cell centre is.
+static void test_surface_offset(void) {
+    printf("sub-voxel surface placement\n");
+
+    octomap_t m;
+    octomap_config_t cfg;
+    octomap_config_defaults(&cfg);
+    check(octomap_init(&m, &cfg) == 0, "map init");
+
+    // 0.25 m leaves. Aim every return at one point well off the centre of the
+    // cell it lands in -- a real surface almost never runs through cell
+    // centres, which is the whole reason the remainder is worth keeping.
+    const double target = 10.0 + 0.09;
+    for (int i = 0; i < 8; i++) fire_ray(&m, target, (uint32_t)(i * 100));
+
+    int depth = 0;
+    double center[3], size = 0.0;
+    const om_node_t *n = octomap_lookup(&m, target, 0.0, 0.0, &depth, center, &size);
+    check(n != NULL, "the cell exists");
+    check(om_node_state(&m, n) == OM_OCCUPIED, "and is occupied");
+
+    if (n) {
+        double sp[3];
+        om_node_surface(n, center, size, sp);
+        const double err_surface = fabs(sp[0] - target);
+        const double err_center  = fabs(center[0] - target);
+
+        // The rays land at a known offset inside the cell, so this is a fact
+        // about geometry, not a tuning: whatever the cell size, the reported
+        // point must be nearer the returns than the centre is.
+        check(err_center > 0.02,
+              "the target is genuinely off-centre in its cell");
+        check(err_surface < err_center * 0.5,
+              "the reported surface point beats the cell centre by 2x");
+        check(err_surface < size * 0.05,
+              "and lands within a twentieth of a cell of the returns");
+        printf("    cell %.3f m: centre off by %.4f m, surface point by %.4f m\n",
+               size, err_center, err_surface);
+    }
+
+    // A cell nothing ever terminated in has no surface to report, and must say
+    // so rather than inventing one -- the fallback is the centre, which is the
+    // most the map actually knows.
+    const om_node_t *free_n = octomap_lookup(&m, 5.0, 0.0, 0.0, &depth, center, &size);
+    check(free_n != NULL && !(free_n->flags & OM_FLAG_HAS_SURFACE),
+          "carved-free cells carry no surface estimate");
+
+    octomap_free(&m);
+}
+
+// Pruning is a memory decision, and it must not be an accuracy decision as
+// well. Collapsing eight cells into their parent triples the cell size, so a
+// parent that forgets what its children knew silently coarsens the map by a
+// factor of two every time the timer fires.
+//
+// The scored fixtures cannot see this. They were tried: reverting the carry-over
+// leaves statue-precision at 1.25x and 100% coverage, because the cells that
+// collapse there get re-hit immediately afterwards and re-establish their own
+// estimate. It needs a case where the collapse is the last thing that happens.
+static void test_surface_survives_prune(void) {
+    printf("surface placement survives a prune\n");
+
+    octomap_t m;
+    octomap_config_t cfg;
+    octomap_config_defaults(&cfg);
+    if (octomap_init(&m, &cfg) != 0) { check(false, "map init"); return; }
+
+    // Eight 0.25 m cells filling one 0.5 m parent, each given the same evidence
+    // so they agree and collapse, and each hit at the same offset inside itself
+    // so the mean of the eight is a point the parent can actually represent.
+    // Siblings, not merely neighbours: a 0.5 m parent's eight children have
+    // centres a quarter-metre apart *from the child at its own low corner*, so
+    // the low corner has to be a real child centre. Straddling zero instead
+    // spreads the same eight points over four parents, two each, and nothing
+    // collapses -- which is what the guard below exists to notice.
+    const double base[3] = { 10.125, 0.125, 0.125 };
+    const double bias = 0.09;             // where in each child the returns land
+    double want_x = 0.0;
+    for (int round = 0; round < 24; round++) {
+        for (int i = 0; i < 8; i++) {
+            om_ray_t r;
+            memset(&r, 0, sizeof(r));
+            r.endpoint[0] = base[0] + ((i & 1) ? 0.25 : 0.0) + bias;
+            r.endpoint[1] = base[1] + ((i & 2) ? 0.25 : 0.0);
+            r.endpoint[2] = base[2] + ((i & 4) ? 0.25 : 0.0);
+            r.hit = 1;
+            r.weight = 1.0f;
+            r.time_ms = (uint32_t)(round * 8 + i);
+            octomap_insert_ray(&m, &r);
+            if (round == 0) want_x += r.endpoint[0] / 8.0;
+        }
+    }
+
+    int depth_before = 0, depth_after = 0;
+    double c0[3], c1[3], size0 = 0.0, size1 = 0.0;
+    const om_node_t *before = octomap_lookup(&m, base[0] + bias, base[1], base[2],
+                                             &depth_before, c0, &size0);
+    check(before != NULL && (before->flags & OM_FLAG_HAS_SURFACE),
+          "the children carry surface estimates before the prune");
+
+    octomap_prune(&m);
+
+    const om_node_t *after = octomap_lookup(&m, base[0] + bias, base[1], base[2],
+                                            &depth_after, c1, &size1);
+    // Self-guarding: if nothing collapsed, everything below would pass for the
+    // wrong reason. This is the assertion that keeps the test honest if the
+    // prune rules ever change out from under it.
+    check(after != NULL && depth_after < depth_before,
+          "the eight cells actually collapsed into their parent");
+
+    if (after && depth_after < depth_before) {
+        double sp[3];
+        om_node_surface(after, c1, size1, sp);
+        const double err_surface = fabs(sp[0] - want_x);
+        const double err_center  = fabs(c1[0] - want_x);
+        check(after->flags & OM_FLAG_HAS_SURFACE,
+              "the collapsed cell kept a surface estimate");
+        check(err_surface < err_center * 0.5,
+              "...and it still beats the parent's centre by 2x");
+        printf("    parent %.3f m: centre off by %.4f m, surface point by %.4f m\n",
+               size1, err_center, err_surface);
+    }
+
+    octomap_free(&m);
+}
+
+// The mirror of the prune case, and it goes the other way: a surface estimate
+// names one point, and that point is inside at most one of the eight children a
+// split produces. Handing it to all eight would give seven of them a position
+// derived from a cell they are not, reinterpreted at half the scale -- a number
+// that looks like knowledge and is not. The child that contains the point gets
+// a true estimate from the return that provoked the split.
+static void test_surface_not_inherited_on_split(void) {
+    printf("surface placement is not inherited by a split\n");
+
+    octomap_t m;
+    octomap_config_t cfg;
+    octomap_config_defaults(&cfg);
+    if (octomap_init(&m, &cfg) != 0) { check(false, "map init"); return; }
+
+    // A wide beam sizes its return to a coarse cell, which then carries an
+    // offset for the whole metre of it.
+    for (int i = 0; i < 6; i++) {
+        om_ray_t r;
+        memset(&r, 0, sizeof(r));
+        r.endpoint[0] = 20.4; r.endpoint[1] = 0.4; r.endpoint[2] = 0.4;
+        r.hit = 1; r.weight = 1.0f; r.cone_radius_m = 1.2f;
+        r.time_ms = (uint32_t)(i * 200);
+        octomap_insert_ray(&m, &r);
+    }
+
+    int depth = 0;
+    double c[3], size = 0.0;
+    const om_node_t *coarse = octomap_lookup(&m, 20.4, 0.4, 0.4, &depth, c, &size);
+    check(coarse != NULL && size > 0.9 && (coarse->flags & OM_FLAG_HAS_SURFACE),
+          "the wide beam leaves a coarse cell with a surface estimate");
+
+    // A narrow beam terminating elsewhere in that same cell splits it.
+    for (int i = 0; i < 6; i++) {
+        om_ray_t r;
+        memset(&r, 0, sizeof(r));
+        r.endpoint[0] = 20.1; r.endpoint[1] = 0.1; r.endpoint[2] = 0.1;
+        r.hit = 1; r.weight = 1.0f;
+        r.time_ms = (uint32_t)(2000 + i * 200);
+        octomap_insert_ray(&m, &r);
+    }
+
+    int d_hit = 0, d_sib = 0;
+    double c_hit[3], c_sib[3], s_hit = 0.0, s_sib = 0.0;
+    const om_node_t *hit = octomap_lookup(&m, 20.1, 0.1, 0.1, &d_hit, c_hit, &s_hit);
+    const om_node_t *sib = octomap_lookup(&m, 20.9, 0.9, 0.9, &d_sib, c_sib, &s_sib);
+
+    check(hit != NULL && d_hit > depth, "the narrow return split the coarse cell");
+    if (hit) {
+        double sp[3];
+        om_node_surface(hit, c_hit, s_hit, sp);
+        check(fabs(sp[0] - 20.1) < 0.01,
+              "the child holding the return knows where it landed");
+    }
+    if (sib) {
+        double sp[3];
+        om_node_surface(sib, c_sib, s_sib, sp);
+        check(!(sib->flags & OM_FLAG_HAS_SURFACE),
+              "a sibling that received no return has no estimate to give");
+        check(fabs(sp[0] - c_sib[0]) < 1e-9,
+              "...and reports its own centre rather than the parent's offset");
+    }
+
+    octomap_free(&m);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -481,6 +681,9 @@ int main(void) {
     test_wide_cone_survives_replay();
     test_manifest_depth();
     test_grazing_order();
+    test_surface_offset();
+    test_surface_survives_prune();
+    test_surface_not_inherited_on_split();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAIL" : "PASS",
            failures, failures == 1 ? "" : "s");

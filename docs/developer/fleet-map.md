@@ -156,6 +156,42 @@ Two calibrations that had to be measured rather than argued:
   levels below the footprint scores better on every statue metric and takes
   `endurance` to 83,697 live nodes against a 60,000 ceiling. One level fits.
 
+**Occupied cells remember where in themselves the surface is.** A cell says
+"occupied", but the return that made it occupied knew more than that: it knew
+*where*. Each leaf carries a three-byte offset from its own centre, updated as a
+quarter-weight running mean of the returns that land in it, and
+`om_node_surface()` reports centre-plus-offset. Anything scoring or drawing a
+surface should ask for that rather than using the centre.
+
+The offset does not descend through a subdivision — it names one point, and that
+point is inside at most one of the eight children — but it *does* survive a
+prune, remapped into the parent's frame. Pruning is a memory decision and must
+not quietly become an accuracy decision; it runs on a timer.
+
+The case for it is memory, not accuracy. On `statue-precision` it improves
+surface placement by 1.25x, which is worth having but is not the 1.8x the TSDF
+spike predicted. What makes it worth its 25% of the node pool is the
+alternative:
+
+| | node pool | centre placement | offset placement |
+| --- | --- | --- | --- |
+| 7.8 mm leaves | 128 MiB | 4.4 mm | — |
+| 7.8 mm leaves + offset | 160 MiB | 4.4 mm | **3.5 mm** |
+| 3.9 mm leaves | ~256 MiB | 3.7 mm | — |
+| 3.9 mm leaves + offset | 320 MiB | 3.7 mm | 3.5 mm |
+
+Buying the same placement accuracy by subdividing costs four times as much
+memory and still does not reach it — the last row is the tell: an extra octree
+level adds nothing once the offset is there, because the offset has already
+taken the placement down to the sensor's own floor.
+
+On every other fixture the gain is 1.01–1.04x, which is noise, and that is the
+correct behaviour rather than a disappointment: those all fly beams whose
+footprint dwarfs their leaves, so the placement error is the sensor's and no
+representation can recover it. The weight of the running mean turns out not to
+matter — 1, 1/2, 1/4 and 1/8 all land between 1.24x and 1.26x — so a quarter is
+chosen to settle over roughly the same span of evidence as the occupancy itself.
+
 **Evidence is weighted.** `covariance` (cm²) and `signal_quality` (%) scale the
 log-odds increment, so a weak return moves the map less than a clean one.
 
