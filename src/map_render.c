@@ -425,31 +425,45 @@ void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
         }
     }
 
-    // Carved space last, with depth writes off.
+    // Carved space last. Ordering is the whole fix.
     //
-    // Free cells are 16% alpha, and drawing them with depth writes enabled lets
-    // a pane of empty air z-reject the surface behind it: the cell in front is
-    // barely visible but it still owns the depth buffer. Because B_FREE is
-    // bucket 0 it was being drawn *before* the surfaces in its own chunk, and
-    // chunks are walked in hash order, so which parts of a surface survived was
-    // decided by a hash. Measured on statue-fleet, every drawable leaf was
-    // reaching the GPU -- 380,798 instances against 380,798 in the map -- while
-    // most of the statue was missing from the picture, which is what sent the
-    // first look at this chasing an extraction backlog that does not exist.
+    // Free cells are 16% alpha and they write depth like anything else, so a
+    // pane of empty air can z-reject the surface behind it: the cell in front
+    // is barely visible but it still owns the depth buffer. B_FREE is bucket 0,
+    // so it was drawn *before* the surfaces in its own chunk, and chunks are
+    // walked in hash order -- which parts of a surface survived was decided by
+    // a hash. Measured on statue-fleet, every drawable leaf was reaching the
+    // GPU (380,798 instances against 380,798 in the map) while most of the
+    // statue was missing from the picture, which is what sent the first look at
+    // this chasing an extraction backlog that does not exist.
     //
-    // Depth *testing* stays on, so a surface still correctly hides the carved
-    // space behind it. Only the write is suppressed, which is the same thing
-    // vehicle.c does for ghost airframes.
+    // Drawing surfaces first fixes it, and the depth writes have to *stay on*
+    // here. They are what limits the veil to roughly its nearest layer; turning
+    // them off lets every layer of a 70 m column of carved air blend in turn
+    // until the volume is opaque. Scored against a free-hidden reference frame,
+    // as the share of surface pixels that still read as surface:
+    //
+    //     free first, depth writes on (the bug)      34.2%
+    //     surfaces first, depth writes off           50.3%
+    //     surfaces first, depth writes on            67.9%
+    //     ... and skipping enclosed free cells       72.2%
+    //
+    // What the write ordering does *not* fix is which of the nearer free cells
+    // blend before the nearest one wins the depth test, so the veil's exact
+    // shade still depends on draw order. That is a shade, not a surface: no
+    // ordering can hide geometry now that the surfaces own the depth buffer
+    // first.
+    //
+    // Flushing matters for the non-instanced fallback, where DrawCube goes
+    // through rlgl's batch: without it the veil could be rasterised alongside
+    // the surfaces rather than after them, and the ordering would buy nothing.
     rlDrawRenderBatchActive();
-    rlDisableDepthMask();
     for (uint32_t i = 0; i < r->chunk_cap; i++) {
         map_chunk_t *chunk = &r->chunks[i];
         if (!chunk->used || chunk->drawn_frame != r->frame) continue;
         if (chunk->count[B_FREE] == 0) continue;
         draw_bucket(r, chunk, B_FREE, theme);
     }
-    rlDrawRenderBatchActive();
-    rlEnableDepthMask();
     r->frame++;
 
     // The all-dirty flag is cleared once every live chunk has latched it into
