@@ -13,10 +13,12 @@
 #include <string.h>
 
 #include "fleet_frame.h"
+#include "map_session.h"
 #include "octomap.h"
 #include "ray_transform.h"
 #include "skynet_manifest.h"
 #include "timebase.h"
+#include "timeline.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -257,6 +259,123 @@ static void test_pool_uses_full_budget(void) {
     octomap_free(&m);
 }
 
+// ------------------------------------------------------ wide-beam replay
+
+// The endpoint cell is sized from the beam cone, and the cone reaches a
+// reconstruction only through the ray log. A log field too narrow to hold a
+// wide beam does not move that cell, it *shrinks* it, and only on the replay
+// side -- so live and a scrub-and-replay stop agreeing about how much of the
+// world one return claimed, for exactly the sensors whose beam is worth
+// widening. Position is unaffected, so only a size comparison catches it.
+//
+// The cone is legible in the cell size only between the leaf and the far-field
+// carve cell, because insert_ray floors hit_depth at coarse_depth. Under the
+// viewer's default 2 m coarse cell every cone wider than a metre lands on the
+// same depth -- an 8.87 m cone and a truncated 2.55 m one both measure 2.00 m
+// there, which is why the check below refuses to run in that regime rather
+// than passing vacuously. This runs the map at the resolution `--map-res 1.0`
+// builds (1 m leaves, 8 m far field), where a 25-degree beam at 40 m is a cell
+// the map can actually place.
+static void test_wide_cone_survives_replay(void) {
+    printf("wide beam through a scrub and replay\n");
+
+    map_session_config_t cfg;
+    map_session_config_defaults(&cfg);
+    cfg.max_depth = 12;          // 1 m leaves under the fixed 4096 m root
+    // 16 m far-field carving. The endpoint cell can never be coarser than this
+    // one, and the cone model places the return a level below the footprint, so
+    // at the 8 m the --map-res default derives both an 8.87 m cone and a
+    // truncated 2.55 m one land on the same 4 m cell and this test would pass
+    // whatever the field width was. Two levels of headroom keeps them apart.
+    cfg.coarse_depth = 8;
+    cfg.map_byte_cap = 16u << 20;
+    cfg.ray_log_bytes = 1u << 20;
+    cfg.keyframe_bytes = 8u << 20;
+    cfg.max_vehicles = 1;
+
+    map_session_t ms;
+    if (map_session_init(&ms, &cfg) != 0) {
+        check(false, "the session initialises");
+        return;
+    }
+    map_session_bind_slot(&ms, 0, 1);
+    map_session_feed_origin(&ms, 0, FLEET_ORIGIN_SRC_GPS_ORIGIN, 47.397742, 8.545594, 488.0);
+
+    const int64_t t_pose = 1000000000LL;
+    const int64_t t_ray  = 2000000000LL;
+    const int64_t t_head = 3000000000LL;
+    // ENU 5 E, 5 N, 26 up, which puts the endpoint 40 m north of it inside a
+    // cell at every depth the two sides could disagree about -- on a face, the
+    // cell it lands in would be settled by a tie-break rather than by the cone.
+    const double ned[3] = { 5.0, 5.0, -26.0 };
+    float level[4]; level_attitude(level);
+
+    map_session_feed_local_ned(&ms, 0, t_pose, ned, NULL);
+    map_session_feed_attitude(&ms, 0, t_pose, level);
+    map_session_tick(&ms, 0.05f);   // takes the first map keyframe, of an empty map
+
+    // A 25-degree sonar ranging a surface 40 m ahead. Covariance and signal
+    // quality are left unknown so the evidence weight is exactly 1 on both
+    // sides of the round trip and the only thing under test is the cone.
+    ray_obs_t o;
+    memset(&o, 0, sizeof(o));
+    o.orientation = 0;                 // MAV_SENSOR_ROTATION_NONE: body +X
+    o.distance_m = 40.0f;
+    o.min_distance_m = 0.5f;
+    o.max_distance_m = 60.0f;
+    o.horizontal_fov_rad = (float)(25.0 * DEG);
+    o.vertical_fov_rad = (float)(25.0 * DEG);
+    o.covariance_cm2 = 255;
+    o.signal_quality = 0;
+    memcpy(o.att_ned_body, level, sizeof(level));
+    map_session_feed_distance(&ms, 0, t_ray, &o);
+    map_session_tick(&ms, 0.05f);
+
+    // One more pose so the head sits past the ray: a playhead at the head
+    // re-pins to live, which would take the incremental path instead of the
+    // reconstruction this test is about.
+    map_session_feed_local_ned(&ms, 0, t_head, ned, NULL);
+    map_session_tick(&ms, 0.05f);
+
+    const double surface[3] = { 5.0, 45.0, 26.0 };
+    const float cone = rt_cone_radius(o.distance_m, o.horizontal_fov_rad, o.vertical_fov_rad);
+
+    int live_depth = 0;
+    double live_size = 0.0;
+    const om_node_t *live = octomap_lookup(&ms.map, surface[0], surface[1], surface[2],
+                                           &live_depth, NULL, &live_size);
+    check(live && om_node_state(&ms.map, live) == OM_OCCUPIED,
+          "the live map holds the surface as occupied");
+    // Below this the beam is one an eight-bit centimetre field could have
+    // carried, and the comparison further down would prove nothing.
+    check(live_size > 2.0 * 2.55,
+          "the live cell is wider than any cell a 2.55 m cone could place");
+
+    // Scrub back before the ray. The map is rebuilt from the keyframe, so the
+    // surface has not been discovered yet.
+    timeline_set_playhead(&ms.timeline, t_pose);
+    const uint32_t back = map_session_resync(&ms);
+    check(back == 0 && octomap_query(&ms.map, surface[0], surface[1], surface[2]) != OM_OCCUPIED,
+          "scrubbing back before the ray unbuilds the surface");
+
+    // ...and forward again over it, which replays the ray out of the log.
+    timeline_set_playhead(&ms.timeline, t_ray);
+    map_session_tick(&ms, 1.0f / 60.0f);
+
+    int rep_depth = 0;
+    double rep_size = 0.0;
+    const om_node_t *rep = octomap_lookup(&ms.map, surface[0], surface[1], surface[2],
+                                          &rep_depth, NULL, &rep_size);
+    printf("    cone %.2f m -> live %.2f m cell (depth %d), replay %.2f m cell (depth %d)\n",
+           (double)cone, live_size, live_depth, rep_size, rep_depth);
+    check(rep && om_node_state(&ms.map, rep) == OM_OCCUPIED,
+          "the reconstruction holds the surface as occupied");
+    check(rep_size == live_size,
+          "...in a cell the same size live placed, not a narrower one");
+
+    map_session_free(&ms);
+}
+
 // ------------------------------------------------------- manifest nesting
 
 static void test_manifest_depth(void) {
@@ -293,6 +412,64 @@ static void test_manifest_depth(void) {
     }
 }
 
+// --------------------------------------------------------- grazing order
+
+// A cell hit by one ray and then skimmed by the neighbouring sectors of the
+// same sweep must survive, and a genuinely removed obstacle must still clear.
+// Nothing scored reaches this: the fixtures that exercise clearing arrange the
+// misses to arrive on their own, and the ones that exercise dense sweeps happen
+// to present the misses before the hit, where clear-on-hit already rescues the
+// cell. The reverse ordering is just as physical and used to lose the surface
+// outright -- twelve grazing rays after a hit drove the cell to the clamp, and
+// further sweeps never recovered it.
+static void fire_ray(octomap_t *m, double end_x, uint32_t t_ms) {
+    om_ray_t r;
+    memset(&r, 0, sizeof(r));
+    r.endpoint[0] = end_x;
+    r.hit = 1;
+    r.weight = 1.0f;
+    r.time_ms = t_ms;
+    octomap_insert_ray(m, &r);
+}
+
+static om_state_t sweep_cell(bool hit_first, int sweeps, uint32_t spacing_ms) {
+    octomap_t m;
+    octomap_config_t cfg;
+    octomap_config_defaults(&cfg);
+    if (octomap_init(&m, &cfg) != 0) return OM_UNKNOWN;
+
+    uint32_t t = 0;
+    for (int s = 0; s < sweeps; s++) {
+        // The hit terminates in the cell at 10 m; the grazing rays pass through
+        // it and terminate at 20 m, exactly as a neighbouring sector aimed at a
+        // further part of the same surface would.
+        if (hit_first) fire_ray(&m, 10.0, t);
+        for (int i = 0; i < 12; i++) fire_ray(&m, 20.0, t += spacing_ms);
+        if (!hit_first) fire_ray(&m, 10.0, t);
+        t += spacing_ms;
+    }
+    const om_state_t st = octomap_query(&m, 10.0, 0.0, 0.0);
+    octomap_free(&m);
+    return st;
+}
+
+static void test_grazing_order(void) {
+    printf("grazing rays either side of a return\n");
+
+    check(sweep_cell(false, 1, 5) == OM_OCCUPIED,
+          "misses before the hit leave the cell occupied");
+    check(sweep_cell(true, 1, 5) == OM_OCCUPIED,
+          "misses after the hit leave it occupied too");
+    check(sweep_cell(true, 4, 5) == OM_OCCUPIED,
+          "...and still do after four sweeps");
+
+    // The shield is a grace period, not immunity. Spread the same misses over
+    // longer than it lasts and the cell clears -- which is what stops this from
+    // turning a removed obstacle into a permanent one.
+    check(sweep_cell(true, 1, 400) == OM_FREE,
+          "misses spread past the grace window still clear the cell");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -301,7 +478,9 @@ int main(void) {
     test_orientation_table();
     test_negative_increment();
     test_pool_uses_full_budget();
+    test_wide_cone_survives_replay();
     test_manifest_depth();
+    test_grazing_order();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAIL" : "PASS",
            failures, failures == 1 ? "" : "s");

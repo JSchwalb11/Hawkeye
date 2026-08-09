@@ -116,7 +116,125 @@ typedef struct {
     map_chunk_t  *chunk;
     uint32_t      focus_mask;
     const octomap_t *map;
+
+    // Carved cells go through this grid instead of straight into the bucket.
+    // NULL wherever meshing does not apply -- a mode that draws no carved
+    // space, or a chunk too deep to rasterise. See "free meshing" below.
+    uint8_t *grid;
+    int      gdim;
+    double   gmin[3];     // ENU corner of the chunk, low side on every axis
+    double   gcell;
 } extract_ctx_t;
+
+// ---------------------------------------------------------------- free meshing
+//
+// Pruning has already merged whatever agreed cube-wise, and what is left is
+// lace: measured on statue-fleet only 30.1% of carved cells are enclosed on all
+// six faces, so dropping the interior thinned the veil by 28% and no sharper
+// face test does much better.
+//
+// Greedy meshing merges the runs the octree cannot, because a box need not be a
+// cube and need not sit on a power-of-two boundary. The volume is unchanged --
+// this is a re-tiling, not an approximation.
+//
+// Merging cannot cross a chunk, and that is the ceiling on what it can buy: a
+// run is at most one chunk long, eight cells for the shipping configuration.
+// Even so it drew statue-fleet's veil with 109,075 boxes where the same carved
+// cells cost 220,247 cubes.
+
+// A grid this size is 256 KiB. Deeper chunks fall back to a cube per leaf
+// rather than allocating a grid whose side doubles per level.
+#define MR_MESH_LEVELS_MAX 6
+#define MR_MESH_DIM_MAX    (1 << MR_MESH_LEVELS_MAX)
+
+// A merged box needs a wider gap than the cells it stands in for, and holding
+// the gap *area* constant is not enough. Shrinking a box by MR_CELL_SHRINK
+// leaves exactly the seam area its cells had -- 8% of the span either way --
+// but concentrated at the two ends, and the surface behind the veil was
+// showing through the seams. Eight small gaps sample what is behind them in
+// eight places; one large gap samples it in one. Measured against the
+// free-hidden reference, as the share of surface pixels that still read as
+// surface:
+//
+//     a cube per carved cell, 0.92 (what this replaces)   72.2%
+//     merged boxes, 0.92 -- the same seam area            67.7%
+//     merged boxes, 0.84                                  70.8%
+//     merged boxes, 0.78                                  74.7%
+//
+// The gap is not free: it paints carved space it has evidence for. Counting
+// every pixel the veil repaints, 0.78 covers 78,273 against the 87,388 a cube
+// per cell covered, so 10% of the veil is traded for the legibility above.
+#define MR_BOX_SHRINK 0.78
+
+static void mesh_mark(extract_ctx_t *x, const om_leaf_t *leaf) {
+    const int N = x->gdim;
+    int lo[3], hi[3];
+    int span = (int)llround(leaf->size / x->gcell);
+    if (span < 1) span = 1;
+    for (int a = 0; a < 3; a++) {
+        const double corner = leaf->center[a] - leaf->size * 0.5;
+        lo[a] = (int)llround((corner - x->gmin[a]) / x->gcell);
+        hi[a] = lo[a] + span - 1;
+        // A leaf coarser than the chunk overhangs it -- the LOD walk reports
+        // such a node whole rather than clipped to the chunk asking for it --
+        // so the range is trimmed here rather than trusted.
+        if (lo[a] < 0) lo[a] = 0;
+        if (hi[a] >= N) hi[a] = N - 1;
+        if (lo[a] > hi[a]) return;
+    }
+    for (int k = lo[2]; k <= hi[2]; k++)
+        for (int j = lo[1]; j <= hi[1]; j++)
+            memset(&x->grid[(k * N + j) * N + lo[0]], 1, (size_t)(hi[0] - lo[0] + 1));
+}
+
+static bool mesh_row_set(const uint8_t *g, int N, int i0, int i1, int j, int k) {
+    for (int i = i0; i <= i1; i++) if (!g[(k * N + j) * N + i]) return false;
+    return true;
+}
+
+// Grow a box along x, then y, then z, taking each axis as far as it goes before
+// moving to the next. Axis order biases which shape wins where several tile the
+// same run, and no order is better than another for a volume this irregular.
+static void mesh_flush(extract_ctx_t *x) {
+    const int N = x->gdim;
+    uint8_t *g = x->grid;
+
+    for (int k = 0; k < N; k++)
+    for (int j = 0; j < N; j++)
+    for (int i = 0; i < N; i++) {
+        if (!g[(k * N + j) * N + i]) continue;
+
+        int i1 = i;
+        while (i1 + 1 < N && g[(k * N + j) * N + i1 + 1]) i1++;
+        int j1 = j;
+        while (j1 + 1 < N && mesh_row_set(g, N, i, i1, j1 + 1, k)) j1++;
+        int k1 = k;
+        while (k1 + 1 < N) {
+            bool ok = true;
+            for (int jj = j; jj <= j1 && ok; jj++) ok = mesh_row_set(g, N, i, i1, jj, k1 + 1);
+            if (!ok) break;
+            k1++;
+        }
+        for (int kk = k; kk <= k1; kk++)
+            for (int jj = j; jj <= j1; jj++)
+                memset(&g[(kk * N + jj) * N + i], 0, (size_t)(i1 - i + 1));
+
+        const int lo[3] = { i, j, k }, hi[3] = { i1, j1, k1 };
+        double centre[3], size[3];
+        for (int a = 0; a < 3; a++) {
+            centre[a] = x->gmin[a] + (lo[a] + hi[a] + 1) * 0.5 * x->gcell;
+            size[a] = (hi[a] - lo[a] + 1) * x->gcell * MR_BOX_SHRINK;
+        }
+        float world[3];
+        fleet_enu_to_world(centre, world);
+        // ENU y is world -z and ENU z is world y, so the extents permute with
+        // the centre.
+        Matrix m = MatrixMultiply(
+            MatrixScale((float)size[0], (float)size[2], (float)size[1]),
+            MatrixTranslate(world[0], world[1], world[2]));
+        bucket_push(x->chunk, B_FREE, m);
+    }
+}
 
 // Is every face neighbour of this carved cell also carved?
 //
@@ -143,6 +261,7 @@ static void extract_leaf(const om_leaf_t *leaf, void *user) {
     if (!occupied) {
         if (!x->r->show_free) return;
         if (!x->r->free_interior && free_interior(x->map, leaf)) return;
+        if (x->grid) { mesh_mark(x, leaf); return; }
     }
 
     int bucket;
@@ -191,9 +310,29 @@ static int lod_for_distance(const octomap_t *map, float distance_m) {
 static void extract_chunk(map_render_t *r, map_session_t *ms, map_chunk_t *c, int lod) {
     for (int b = 0; b < MAP_RENDER_BUCKETS; b++) c->count[b] = 0;
 
-    extract_ctx_t x = { r, c, map_session_focus_mask(ms), &ms->map };
+    extract_ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.r = r;
+    x.chunk = c;
+    x.map = &ms->map;
+    x.focus_mask = map_session_focus_mask(ms);
     if (x.focus_mask == 0) x.focus_mask = om_vehicle_bit(0);
+
+    const bool draws_free = r->show_free
+        && (r->mode == MAP_DRAW_OCCUPANCY || r->mode == MAP_DRAW_COVERAGE);
+    const int levels = lod - ms->map.chunk_depth;
+    if (r->free_mesh && draws_free && levels >= 0 && levels <= MR_MESH_LEVELS_MAX) {
+        double centre[3], size;
+        octomap_chunk_center(&ms->map, c->key, centre, &size);
+        x.gdim = 1 << levels;
+        x.gcell = size / (double)x.gdim;
+        for (int a = 0; a < 3; a++) x.gmin[a] = centre[a] - size * 0.5;
+        x.grid = r->mesh_grid;
+        memset(x.grid, 0, (size_t)x.gdim * x.gdim * x.gdim);
+    }
+
     octomap_iterate_chunk_lod(&ms->map, c->key, lod, extract_leaf, &x);
+    if (x.grid) mesh_flush(&x);
     c->lod_depth = lod;
     r->stats.chunks_extracted++;
 }
@@ -206,6 +345,7 @@ int map_render_init(map_render_t *r) {
     r->mode = MAP_DRAW_OCCUPANCY;
     r->visible = true;
     r->show_free = true;
+    r->free_mesh = true;
     r->max_draw_distance_m = 400.0f;
     r->extract_budget = 24;
     // Frame 0 is never a valid "drawn this frame" stamp, because a fresh chunk
@@ -213,6 +353,11 @@ int map_render_init(map_render_t *r) {
     r->frame = 1;
 
     if (!table_alloc(r, MR_INITIAL_CHUNKS)) return -1;
+
+    // One grid serves every chunk, because extraction is not re-entrant.
+    const size_t grid_bytes = (size_t)MR_MESH_DIM_MAX * MR_MESH_DIM_MAX * MR_MESH_DIM_MAX;
+    r->mesh_grid = (uint8_t *)malloc(grid_bytes);
+    if (!r->mesh_grid) r->free_mesh = false;   // a cube per cell still draws
 
     r->cube = GenMeshCube(1.0f, 1.0f, 1.0f);
 
@@ -244,6 +389,8 @@ void map_render_free(map_render_t *r) {
         if (r->chunks[i].used) chunk_release(&r->chunks[i]);
     free(r->chunks);
     r->chunks = NULL;
+    free(r->mesh_grid);
+    r->mesh_grid = NULL;
     UnloadMesh(r->cube);
     if (r->shader.id != 0) UnloadShader(r->shader);
     r->ready = false;

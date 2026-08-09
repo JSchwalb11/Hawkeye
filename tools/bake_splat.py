@@ -125,7 +125,13 @@ def main():
     ap.add_argument("obj")
     ap.add_argument("out")
     ap.add_argument("--height", type=float, default=93.0,
-                    help="target height in metres for the whole model")
+                    help="target height in metres; 0 keeps the source scale, "
+                         "which is what a mesh already in metres wants")
+    ap.add_argument("--up", choices=("auto", "x", "y", "z"), default="auto",
+                    help="which source axis points up. 'auto' takes the longest "
+                         "extent, which is right for a standing figure and wrong "
+                         "for a room -- a hall 25 m long and 7 m tall would be "
+                         "stood on its end")
     ap.add_argument("--count", type=int, default=40000)
     ap.add_argument("--seed", type=int, default=20260808)
     ap.add_argument("--flatten", type=float, default=6.0,
@@ -143,8 +149,8 @@ def main():
     lo = [min(v[i] for v in verts) for i in range(3)]
     hi = [max(v[i] for v in verts) for i in range(3)]
     ext = [hi[i] - lo[i] for i in range(3)]
-    up = ext.index(max(ext))
-    scale = args.height / ext[up]
+    up = ext.index(max(ext)) if args.up == "auto" else "xyz".index(args.up)
+    scale = (args.height / ext[up]) if args.height > 0.0 else 1.0
 
     def place(p):
         q = [(p[i] - (lo[i] + hi[i]) * 0.5) * scale for i in range(3)]
@@ -166,6 +172,10 @@ def main():
 
     if total_area <= 0.0:
         sys.exit("degenerate mesh")
+
+    plo = [min(min(t[k][i] for k in range(3)) for t in tris) for i in range(3)]
+    phi = [max(max(t[k][i] for k in range(3)) for t in tris) for i in range(3)]
+    placed_ext = [phi[i] - plo[i] for i in range(3)]
 
     # Area-weighted sampling: a splat cloud with the same number of Gaussians on
     # a large flat panel as on a small detail would misrepresent both.
@@ -229,9 +239,13 @@ def main():
                                        for c in q]))
     out.close()
 
-    print("%s: %d splats, %.1f m tall, %.1f m^2 surface, "
+    # Report the height actually placed, not the one requested -- with
+    # --height 0 the request is "keep the source scale" and echoing the zero
+    # says nothing about what came out.
+    print("%s: %d splats, %.2f x %.2f x %.2f m, %.1f m^2 surface, "
           "sigma %.3f m tangential / %.3f m normal"
-          % (args.out, args.count, args.height, total_area, sigma_t, sigma_n))
+          % (args.out, args.count, placed_ext[0], placed_ext[1], placed_ext[2],
+             total_area, sigma_t, sigma_n))
 
 
 if __name__ == "__main__":

@@ -78,7 +78,15 @@ typedef struct {
     bool      show_free;
     // Draw carved cells that are enclosed by other carved cells. Off by
     // default: they are invisible by construction and cost only overdraw.
+    // Turning it on with free_mesh also on is measurably worse on both counts
+    // -- the interior gives the merge more to swallow, so the veil ends up
+    // solider *and* larger.
     bool      free_interior;
+    // Merge contiguous carved cells into boxes rather than drawing a cube per
+    // cell. Off leaves the cube-per-cell path, which is also what runs when a
+    // chunk is too deep to rasterise.
+    bool      free_mesh;
+    uint8_t  *mesh_grid;         // scratch for the merge, one chunk's worth
     float     max_draw_distance_m;
     int       extract_budget;    // chunks re-extracted per frame
     uint32_t  frame;             // draw counter, for drawn_frame above

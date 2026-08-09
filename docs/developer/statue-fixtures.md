@@ -88,25 +88,35 @@ the precision section below for why that distinction has teeth.
 
 | | solo | fleet |
 | --- | --- | --- |
-| surface RMS | 0.243 m | 0.177 m |
-| false-occupied | 0.049 | 0.025 |
-| false-free | 0.0005 | 0.0006 |
-| shape recall | 0.9996 | 1.0000 |
-| shape precision (strict / ±1 voxel) | 0.526 / 0.995 | 0.531 / 0.996 |
-| whole-cloud coverage | 0.881 | 0.897 |
-| merged surface | — | 0.9994 |
-| best single drone alone | — | 0.371 |
+| surface RMS | 0.253 m | 0.262 m |
+| false-occupied | 0.028 | 0.033 |
+| false-free | 0.0011 | 0.0028 |
+| shape recall | 0.9817 | 0.9812 |
+| shape precision (strict / ±1 voxel) | 0.464 / 0.978 | 0.464 / 0.978 |
+| shape IoU (strict, 1 m lattice) | 0.420 | 0.424 |
+| whole-cloud coverage | 0.816 | 0.830 |
+| merged surface | — | 0.9972 |
+| best single drone alone | — | 0.353 |
 
 The fleet reaches more of the statue in half the time, and no single drone
-accounts for more than 38% of the observed surface. That is the cooperative
+accounts for more than 36% of the observed surface. That is the cooperative
 claim on a real object rather than on a box.
 
-RMS and false-occupied are both about twice what they were before the erosion
-fix below, and that is the trade it makes: the map now keeps the marginal cells
-that carving used to erase, and some of them sit a leaf further out. At 0.25 m
-leaves an RMS of 0.243 m is one leaf, ±1-voxel precision is unchanged at 0.995,
-and recall goes from 0.976 to 1.000 — the extra cells are on the statue's
-edges, not scattered.
+These are the figures for the **beam** sensor model — carving the cone and
+spreading the return across its footprint. An earlier revision of this table
+read better on every row (0.243 m RMS, 0.9996 recall, 0.526 strict precision)
+and was scored against an injector that reported range along the beam axis
+rather than the nearest surface anywhere in the beam, which is not what
+`OBSTACLE_DISTANCE` means. Against a faithful injector the same map scores
+0.4537 m RMS and 0.8726 recall and fails five thresholds — the numbers got
+worse because the sensor got real, and the beam model is what brings them back
+inside thresholds that never moved. See
+[fleet-map.md](fleet-map.md#why-the-beam-is-modelled-as-a-beam).
+
+Read the residual honestly: at 0.25 m leaves a 0.25 m RMS is one leaf, and it
+is dominated by the footprint spread rather than by scatter — ±1-voxel
+precision is 0.978 while strict precision is 0.464, which is the signature of
+cells sitting *near* the surface rather than in the wrong place.
 
 ## Watching it happen
 
@@ -183,9 +193,15 @@ were sampled from, and scores against them too. `tools/bake_splat.py --tri`
 writes them; `test/trimesh.c` does Möller–Trumbore and exact point-triangle
 distance.
 
-**Result: surface RMS 0.0009 m, max error 0.0066 m, false-occupied 0.00000,
-false-free 0.0005.** Nine tenths of a millimetre, against an exact reference,
-with 99.95% of observed surface represented.
+**Result: surface RMS 0.0019 m, max error 0.0106 m, false-occupied 0.00000,
+false-free 0.00000, shape recall 1.00000.** Under two millimetres against an
+exact reference, with every observed surface voxel represented.
+
+(This read 0.0009 m before the beam model. The fixture flies a 0.09° beam, so
+its footprint at range is still sub-centimetre and the spread costs it about a
+millimetre of RMS — the price is paid here in exchange for the map agreeing
+with what a real sensor reports. It buys back the last of the false-free rate:
+0.0005 → 0.00000.)
 
 ### The erosion bug this fixture found
 
@@ -222,12 +238,12 @@ four rows is a rule about cells that are *already* occupied, so all four arrive
 too late to matter — which is why suppressing misses, in three different
 flavours, moves the number by 0.001.
 
-Clearing on the hit is order-independent and needs no extra state: a range
-return zeroes any accumulated free evidence before its own is applied. It says
-a present-tense measurement of a surface outranks any amount of inference drawn
-from rays that merely passed nearby. Because it fires only on a hit, an
-obstacle that is genuinely removed gets no resets and still carves away to
-free — `vanishing` still reports zero cells on removed geometry.
+Clearing on the hit needs no extra state: a range return zeroes any accumulated
+free evidence before its own is applied. It says a present-tense measurement of
+a surface outranks any amount of inference drawn from rays that merely passed
+nearby. Because it fires only on a hit, an obstacle that is genuinely removed
+gets no resets and still carves away to free — `vanishing` still reports zero
+cells on removed geometry.
 
 The same change lifts the decimetre fixtures: `statue-solo` goes from 0.0219
 false-free to 0.0005 and `statue-fleet` from 0.0123 to 0.0006, shape recall
@@ -237,11 +253,34 @@ quietly making every drone see everything. On the twelve plane fixtures nothing
 regresses; `disagreement`, which flies a deliberate localisation offset, gets
 markedly better (surface RMS 1.245 → 1.054 m, false-free 0.409 → 0.128).
 
+(Those figures are against the axis-range injector this section was written
+under. The beam model changes them — see the table at the top — but not the
+mechanism or the conclusion.)
+
+**This paragraph originally described the rule as order-independent. It is
+not.** It wipes free evidence that arrived *before* a return and does nothing
+about the reverse, which is just as physical: a beam terminates in a cell and,
+tens of milliseconds later, the neighbouring sectors of the same sweep skim
+through it. On a bare cell given one hit and twelve grazing rays, misses-first
+leaves log-odds +17 and occupied; hit-first leaves −70 and free, and four
+further sweeps never recover it. No statue orbit presents its misses after the
+hit, which is why no fixture caught it. A cell cannot tell a grazing pass from a
+removed obstacle — both are rays passing through and terminating elsewhere — but
+time can: a sweep is over in well under a second, a removal keeps producing
+misses indefinitely. A return now shields its cell for `hit_grace_ms` (1 s) and
+no longer, which costs a spare bit in `flags` and the `last_seen_ms` already
+there. Pinned by `test_grazing_order`.
+
 A TSDF would have prevented this class of bug outright — a ray passing near a
 surface writes a positive signed distance rather than "empty", so a zero
-crossing survives a grazing pass — and it resolves a surface to roughly
-voxel/10 at 1/125 the cell count of a 1 cm binary grid. That remains the right
-representation for centimetre work and is not part of this change.
+crossing survives a grazing pass. **The rest of what this paragraph used to
+claim was measured and refuted**: built on one lattice with one traversal
+against a binary control grid, the field resolves to cell/6 against the grid's
+cell/3.4 — a 1.8x linear gain, not 10x — and matching the shipped map's 3.27 mm
+needs ~15 mm voxels, where it holds 6.3x more cells at 374 MiB against 38.3 MiB
+rather than 1/125 as many. Do not do the rewrite; the accuracy that would
+justify it is available far more cheaply as a sub-voxel offset on occupied
+leaves. See [follow-ups.md](follow-ups.md).
 
 Two limits are worth stating because a fixture cannot supply them:
 

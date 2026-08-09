@@ -19,3 +19,8 @@ android/.idea/*
 node_modules/
 docs/.vitepress/cache/
 docs/.vitepress/dist/
+
+# Agent worktrees. Isolated checkouts of this same repository, created under
+# .claude/ while background agents run and removed when they finish -- never
+# content, and committing them would nest the repo inside itself.
+.claude/worktrees/

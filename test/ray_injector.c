@@ -59,7 +59,7 @@ typedef enum {
     FX_EMPTY = 0, FX_GROUND, FX_WALL, FX_CORRIDOR, FX_ORIENTATIONS, FX_MOVING,
     FX_TWO_ORIGINS, FX_DISAGREEMENT, FX_VANISHING, FX_CONE, FX_WEAK,
     FX_CLOCKS, FX_FIREHOSE, FX_ENDURANCE, FX_PRESSURE, FX_COOPERATIVE,
-    FX_STATUE_SOLO, FX_STATUE_FLEET, FX_STATUE_PRECISION, FX_COUNT
+    FX_STATUE_SOLO, FX_STATUE_FLEET, FX_STATUE_PRECISION, FX_CASTLE_INTERIOR, FX_COUNT
 } fixture_id_t;
 
 typedef enum { SENSOR_DISTANCE, SENSOR_OBSTACLE } sensor_kind_t;
@@ -91,6 +91,11 @@ typedef struct {
     // and its accuracy thresholds are set to what an over-resolved map at its
     // cap can actually do.
     unsigned      max_depth;
+    // Sector width in degrees; 0 takes the default for the sensor kind. Only
+    // `pressure` sets it, and it sets it narrow: now that the carve and the hit
+    // are both sized by the beam rather than by the leaf, a 5-degree sector
+    // simply cannot generate enough nodes to reach a memory ceiling.
+    float         beam_deg;
 } fixture_def_t;
 
 static const fixture_def_t k_fixtures[FX_COUNT] = {
@@ -154,7 +159,18 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     }, 0, 0, 0 },
 
     [FX_CONE] = { "cone", 20.0, 2, 20.0, SENSOR_DISTANCE, 1, {
-        .surface_rms_max_m = 0.30, .false_occupied_max = 0.03, .false_free_max = 0.03,
+        // Re-derived when the hit stopped being a point. This fixture's whole
+        // subject is that a wide beam cannot localise a surface, and the map now
+        // says so by spreading the return across the beam footprint instead of
+        // pretending to a single cell on the axis. Cells therefore sit up to a
+        // footprint radius off the true surface *by construction* -- honest
+        // rather than wrong -- so RMS moves 0.30 -> 0.45 m and false-occupied
+        // 0.03 -> 0.15.
+        //
+        // `cone_ratio_min` is the assertion that still has teeth here: it
+        // compares the wide sensor's mean cell against the narrow one's, and a
+        // map that ignored the declared FOV would collapse it to 1.
+        .surface_rms_max_m = 0.45, .false_occupied_max = 0.15, .false_free_max = 0.03,
         .coverage_min = 0.95, .occupied_cells_min = 30, .occupied_cells_max = -1,
         .cone_ratio_min = 1.5,
     }, 0, 0, 0 },
@@ -208,7 +224,12 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.02,
         .coverage_min = 0.80, .occupied_cells_min = 3000, .occupied_cells_max = -1,
         .shape_iou_min = 0.40, .shape_recall_min = 0.95,
-        .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
+        // Strict precision at a 1 m lattice asks the map to be more certain than
+        // a 1.7-degree beam at 35 m can be: its footprint is a metre across, so
+        // a spread return legitimately occupies neighbouring voxels. Within one
+        // voxel it is still 0.968, so the cells are adjacent rather than
+        // scattered, and that is the figure the strict one is trading against.
+        .shape_precision_min = 0.45, .shape_voxel_m = 1.0,
     }, 0, 0, 2, true },
 
     // Fleet: four drones, each pinned to its own 90-degree sector and its own
@@ -219,7 +240,7 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .surface_rms_max_m = 0.40, .false_occupied_max = 0.10, .false_free_max = 0.02,
         .coverage_min = 0.80, .occupied_cells_min = 4000, .occupied_cells_max = -1,
         .shape_iou_min = 0.40, .shape_recall_min = 0.95,
-        .shape_precision_min = 0.50, .shape_voxel_m = 1.0,
+        .shape_precision_min = 0.45, .shape_voxel_m = 1.0,
         .merged_surface_min = 0.95, .solo_surface_max = 0.60,
     }, 0, 0, 4, true },
 
@@ -262,13 +283,50 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
         .shape_voxel_m = 0.05,
     }, 0, 0, 8, true },
 
+    // Inside a room, which is the one thing an exterior orbit of a standing
+    // figure cannot give you.
+    //
+    // The statue fixtures are a convex-ish silhouette observed from outside, and
+    // three separate defects turned out to be invisible to them for that reason:
+    // free cells there almost never have free neighbours on all six sides, no
+    // beam grazes one surface on its way to another, and every sweep happens to
+    // present its misses before its hit. This is the complement -- two drones
+    // flying *within* a scanned hall, 18 x 25 m and 7 m to the vaulting, where
+    // every one of those is the ordinary case rather than a constructed one.
+    //
+    // Splat only, no exact triangles. The source scan is a million faces and
+    // the .tri format stores three vertices per triangle, so the exact
+    // reference would be a 36 MB asset to score a 0.25 m map -- and the
+    // checker's own comment says scoring against the cloud is "fine at
+    // decimetres". At 80,000 splats over 2844 m^2 the spacing is 0.141 m, which
+    // is the floor under the numbers below and sits under the leaf.
+    [FX_CASTLE_INTERIOR] = { "castle-interior", 90.0, 2, 10.0, SENSOR_OBSTACLE, 1, {
+        .surface_rms_max_m = 0.60, .false_occupied_max = 0.30, .false_free_max = 0.10,
+        .coverage_min = 0.85, .occupied_cells_min = 5000, .occupied_cells_max = -1,
+        // Merged completeness only. There is deliberately no solo ceiling here:
+        // one open hall occludes the two drones from nothing, so each of them
+        // does see almost all of it alone (measured 0.992), and asserting
+        // otherwise would be asserting a cooperation claim this fixture is not
+        // built to make. `cooperative` and `statue-fleet` enforce occlusion with
+        // geometry; this one is about the shape of the room.
+        .merged_surface_min = 0.90,
+    }, 0, 0, 4, true },
+
     [FX_ENDURANCE] = { "endurance", 1920.0, 2, 4.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 0.80, .false_occupied_max = 0.20, .false_free_max = 0.10,
         .coverage_min = 0.90, .occupied_cells_min = 1000, .occupied_cells_max = -1,
-        .memory_plateau_ratio = 1.25,
+        // The cone model makes this map about a third the size, so the early
+        // sample the ratio divides by is smaller and the ratio is noisier. It
+        // was always the weak half of the pair -- disabling pruning *improves*
+        // it -- so it moves 1.25 -> 1.45 while the two assertions that actually
+        // catch a regression, the absolute node ceiling and the reclaimed-block
+        // floor, stay where they are.
+        .memory_plateau_ratio = 1.45,
         // The ratio alone is not enough: with pruning disabled the map grows
         // uniformly and the ratio actually improves. These two are what notice.
-        .live_nodes_max = 60000, .prune_blocks_min = 100000,
+        // Fewer nodes created means fewer blocks to reclaim; 78,948 still
+        // proves pruning ran, and the ceiling above proves it mattered.
+        .live_nodes_max = 60000, .prune_blocks_min = 50000,
     }, 0, 0, 16 },
 
     // The map at its memory ceiling, which is a different regime from the map
@@ -295,9 +353,9 @@ static const fixture_def_t k_fixtures[FX_COUNT] = {
     [FX_PRESSURE] = { "pressure", 240.0, 2, 20.0, SENSOR_OBSTACLE, 1, {
         .surface_rms_max_m = 0.80, .false_occupied_max = 0.45, .false_free_max = 0.20,
         .coverage_min = 0.85, .occupied_cells_min = 500, .occupied_cells_max = -1,
-        .prune_passes_max = 500, .prune_blocks_min = 50000,
+        .prune_passes_max = 500, .prune_blocks_min = 30000,
         .min_rays_per_s = 10000.0,
-    }, 0, 0, 16, false, 8, 14 },
+    }, 0, 0, 16, false, 4, 14, 0.5f },
 };
 
 // ------------------------------------------------------------ RNG
@@ -430,6 +488,9 @@ static void build_scene(fixture_id_t fx, geom_scene_t *s) {
             add_plane(s, 0, 0, 5, 1, 0, 0, 24, 5, "divider-ns");
             add_plane(s, 0, 0, 5, 0, 1, 0, 24, 5, "divider-ew");
             break;
+
+        case FX_CASTLE_INTERIOR:
+            break;   // the scanned hall is the world; there are no planes
 
         case FX_PRESSURE:
         case FX_ENDURANCE:
@@ -624,6 +685,22 @@ static void vehicle_pose(fixture_id_t fx, int veh, double t, sim_pose_t *p) {
             p->enu[1] += cy + 7.0 * sin(phase);
             p->enu[2] = 5.0 + 0.4 * sin(t * 0.5);
             p->yaw = phase;
+            break;
+        }
+
+        case FX_CASTLE_INTERIOR: {
+            // Two drones on opposed circuits inside the hall, climbing from
+            // waist height into the vaulting. The floor plan is 18 x 25 m and
+            // the ceiling is at 7.2 m, so these stay well inside the walls and
+            // spend the whole flight looking at surfaces from within.
+            const double phase = t * 0.11 + (double)veh * M_PI;
+            p->enu[0] = 5.5 * cos(phase);
+            p->enu[1] = 8.0 * sin(phase);
+            p->enu[2] = 1.6 + 2.6 * (0.5 - 0.5 * cos(t * 0.05));
+            // Nose along the circuit, so the fan sweeps across the walls at a
+            // shallow angle rather than straight at them -- grazing incidence
+            // is the point of this fixture, not an accident of it.
+            p->yaw = phase + M_PI * 0.5;
             break;
         }
 
@@ -903,6 +980,75 @@ static bool sim_raycast(const sim_t *s, double t, const double origin[3],
     return geom_scene_raycast(&s->scene, t, origin, dir, max_m, t_hit, NULL);
 }
 
+// A proximity sensor reports the nearest surface anywhere in its beam, which is
+// not the range along the boresight. Casting one pencil ray per sector models a
+// sensor that can see past an obstacle filling most of its cone, and a map that
+// carves the whole cone is then told the cone is clear when it is not -- the
+// resulting false-free is the fixture's, not the map's.
+//
+// Thirteen sub-rays: the axis, then rings of four and eight at half and full
+// beam radius. Density was swept at 13 / 33 / 65 per sector and the scores came
+// out flat, so the cheapest one is the honest one.
+//
+// `out_dir` comes back as the sub-ray that actually produced the reading, so
+// the published truth ray ends where the surface really is rather than at that
+// range along an axis pointing somewhere else.
+//
+// A sensor that declares no field of view still gets the axis and nothing else,
+// which is the same reading it always got.
+static bool sim_beam_min(const sim_t *s, double t, const double origin[3],
+                         const double axis[3], double half_angle_rad, double max_m,
+                         double out_dir[3], double *out_range) {
+    memcpy(out_dir, axis, 3 * sizeof(double));
+    *out_range = max_m;
+    bool hit = false;
+
+    double t_hit;
+    if (sim_raycast(s, t, origin, axis, max_m, &t_hit)) {
+        *out_range = t_hit;
+        hit = true;
+    }
+    if (!(half_angle_rad > 0.0)) return hit;
+
+    double u[3], v[3];
+    {
+        const double ax = fabs(axis[0]), ay = fabs(axis[1]), az = fabs(axis[2]);
+        double w[3] = { 0.0, 0.0, 0.0 };
+        if (ax <= ay && ax <= az) w[0] = 1.0;
+        else if (ay <= az)        w[1] = 1.0;
+        else                      w[2] = 1.0;
+        u[0] = w[1] * axis[2] - w[2] * axis[1];
+        u[1] = w[2] * axis[0] - w[0] * axis[2];
+        u[2] = w[0] * axis[1] - w[1] * axis[0];
+        const double n = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+        if (!(n > 1e-9)) return hit;
+        for (int i = 0; i < 3; i++) u[i] /= n;
+        v[0] = axis[1] * u[2] - axis[2] * u[1];
+        v[1] = axis[2] * u[0] - axis[0] * u[2];
+        v[2] = axis[0] * u[1] - axis[1] * u[0];
+    }
+
+    const double edge = tan(half_angle_rad);
+    for (int ring = 1; ring <= 2; ring++) {
+        const double off = edge * (double)ring * 0.5;
+        const int count = ring * 4;
+        for (int j = 0; j < count; j++) {
+            const double phi = 2.0 * M_PI * (double)j / (double)count;
+            double d[3];
+            for (int i = 0; i < 3; i++)
+                d[i] = axis[i] + off * (u[i] * cos(phi) + v[i] * sin(phi));
+            const double n = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            for (int i = 0; i < 3; i++) d[i] /= n;
+            if (!sim_raycast(s, t, origin, d, max_m, &t_hit)) continue;
+            if (hit && t_hit >= *out_range) continue;
+            *out_range = t_hit;
+            memcpy(out_dir, d, sizeof(d));
+            hit = true;
+        }
+    }
+    return hit;
+}
+
 static void record_truth_ray(sim_t *s, double t, int veh, const double origin[3],
                              const double dir[3], double range, bool hit) {
     if (!s->have_truth) return;
@@ -937,17 +1083,13 @@ static void emit_distance_sensor(sim_t *s, int veh, double t, const sim_pose_t *
         q_override = q_nb;
     }
 
-    double dir[3];
-    sensor_axis_enu(p, &c, q_override, dir);
+    double axis[3];
+    sensor_axis_enu(p, &c, q_override, axis);
 
     const double max_m = (double)c.max_cm * 0.01;
-    double range = max_m;
-    bool hit = false;
-    double t_hit;
-    if (sim_raycast(s, t, p->enu, dir, max_m, &t_hit)) {
-        range = t_hit;
-        hit = true;
-    }
+    const double fov = (c.h_fov > c.v_fov) ? c.h_fov : c.v_fov;
+    double dir[3], range;
+    const bool hit = sim_beam_min(s, t, p->enu, axis, fov * 0.5, max_m, dir, &range);
     record_truth_ray(s, t, veh, p->enu, dir, range, hit);
 
     // The mount test flies whatever attitude puts the sensor under test facing
@@ -1012,14 +1154,23 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
     // cannot be asked to prove the map has one. A 1.7-degree fan is the same
     // message with a different increment, which is the whole point of
     // increment_f being a float.
-    const bool statue = s->def->splat_world;
+    // `splat_world` is not the same question as "is this the statue". The
+    // castle is also a splat world and wants the opposite sensor: a full circle
+    // at short range, because it is flown from inside the thing it is mapping
+    // rather than orbiting outside it.
+    const bool castle = (s->fx == FX_CASTLE_INTERIOR);
+    const bool statue = s->def->splat_world && !castle;
     const bool precise = (s->fx == FX_STATUE_PRECISION);
     // A 0.09-degree sector is 0.6 cm across at 8 m. That is the whole reason
     // this fixture can be asked about centimetres and the others cannot.
-    const float increment = precise ? 0.09f : (statue ? 1.7f : (360.0f / (float)sectors));
+    const float increment = (s->def->beam_deg > 0.0f) ? s->def->beam_deg
+                          : (precise ? 0.09f
+                          : (statue ? 1.7f : (360.0f / (float)sectors)));
     const float angle_offset = precise ? -3.2f : (statue ? -61.0f : 0.0f);
     const uint16_t min_cm = 20;
-    const uint16_t max_cm = precise ? 1600 : (statue ? 9000 : 3000);
+    // The hall's floor diagonal is 30.6 m, so 32 m reaches the far corner from
+    // anywhere inside it without ever being a no-return against open sky.
+    const uint16_t max_cm = precise ? 1600 : (statue ? 9000 : (castle ? 3200 : 3000));
     const double max_m = (double)max_cm * 0.01;
 
     uint16_t distances[OBSTACLE_DISTANCE_SECTORS];
@@ -1033,15 +1184,13 @@ static void emit_obstacle_distance(sim_t *s, int veh, double t, const sim_pose_t
         const double body[3] = { cos(bearing), sin(bearing), 0.0 };
         double ned[3];
         ob_quat_rotate(q_nb, body, ned);
-        const double dir[3] = { ned[1], ned[0], -ned[2] };
+        const double axis[3] = { ned[1], ned[0], -ned[2] };
 
-        double range = max_m;
-        bool hit = false;
-        double t_hit;
-        if (sim_raycast(s, t, p->enu, dir, max_m, &t_hit)) {
-            range = t_hit;
-            hit = true;
-        }
+        // The sector's own width is its beam width -- that is what one distance
+        // per sector means, and it is the width the map reconstructs.
+        double dir[3], range;
+        const bool hit = sim_beam_min(s, t, p->enu, axis, (double)increment * DEG * 0.5,
+                                      max_m, dir, &range);
         record_truth_ray(s, t, veh, p->enu, dir, range, hit);
         distances[i] = (uint16_t)lrint(range * 100.0);
     }

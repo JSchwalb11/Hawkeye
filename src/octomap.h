@@ -57,8 +57,12 @@ typedef struct {
     int8_t   log_odds;
     uint8_t  agree;         // cross-vehicle corroboration, saturating
     uint8_t  disagree;      // cross-vehicle contradiction, saturating
+    // Bit 0 marks a cell whose last applied update was a range return. It is
+    // what gives `hit_grace_ms` something to measure from -- see node_apply.
     uint8_t  flags;
 } om_node_t;
+
+#define OM_FLAG_FRESH_HIT 0x01
 
 typedef enum {
     OM_UNKNOWN = 0,
@@ -105,6 +109,12 @@ typedef struct {
     int8_t     occ_threshold;
     int8_t     free_threshold;
     uint8_t    prune_tolerance;      // max sibling log-odds spread that still collapses
+    // How long a range return shields its cell from free evidence. A grazing
+    // pass is a sub-second burst; a removed obstacle keeps producing misses for
+    // as long as anyone looks. Time is what separates them -- a ray count
+    // cannot, because both arrive in bulk.
+    uint32_t   hit_grace_ms;
+
     uint8_t    contested_pct;        // disagree share, in percent, that marks a cell contested
     uint8_t    contested_min_votes;  // minimum agree+disagree before a cell can be contested
 
@@ -127,6 +137,7 @@ typedef struct {
     size_t  byte_cap;      // 0 -> 256 MiB
     double  refine_dist_m; // 0 -> 1.5
     double  skip_near_m;   // 0 -> 1.0
+    int     hit_grace_ms;  // 0 -> 1000; negative disables the shield
 } octomap_config_t;
 
 void octomap_config_defaults(octomap_config_t *cfg);

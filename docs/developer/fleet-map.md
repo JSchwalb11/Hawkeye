@@ -73,56 +73,88 @@ full depth, whatever the distance.
 nothing occupied. Getting this wrong builds a wall at sensor range around every
 flight; the `empty` fixture asserts zero occupied cells.
 
-**Cones, not lasers.** `horizontal_fov` / `vertical_fov` widen the occupied
-endpoint with distance by choosing a coarser depth for it. A 25° sonar at 12 m
-produces a 2 m cell where a 1° laser produces a 0.25 m one.
+**Cones, not lasers — on both halves of the ray.** `horizontal_fov` /
+`vertical_fov` widen the occupied endpoint with distance by choosing a coarser
+depth for it: a 25° sonar at 12 m produces a 2 m cell where a 1° laser produces
+a 0.25 m one. The *carve* is the matching cone, not the axis, and the return is
+spread across the beam's footprint rather than marked at a point.
 
-The *carve*, though, is still a pencil ray along the beam axis. That asymmetry
-is deliberate, and it was measured rather than assumed — see below.
+### Why the beam is modelled as a beam
 
-### Why the carve is a ray and not a cone
+MAVLink defines a proximity reading as the distance to the **nearest** surface
+anywhere in the beam. Two things follow, and the map has to honour both or it
+disagrees with the message it was handed:
 
-A beam is physically a cone, and a proximity sensor reports the nearest surface
-anywhere within it, so everything inside the cone nearer than the reported range
-is provably empty. Carving that cone instead of its axis would close the gaps
-between adjacent sectors — a 1.7° fan at 35 m leaves about a metre between
-neighbouring rays, which is why the carved volume is a bundle of thin cones with
-unobserved space between them rather than a solid region.
+* everything inside the cone nearer than that range is provably empty, so the
+  carve is the cone;
+* the range says a surface is *somewhere* on the cone's end cap — a disjunction
+  an occupancy grid cannot hold — so committing it to the single cell on the
+  axis invents a localisation the sensor never had.
 
-It was implemented and scored. Two things came out of it.
+Doing only the first is worse than doing neither. Cone-wide free against
+point-wide occupied erodes any surface whose beam footprint exceeds a leaf,
+which is why an earlier attempt at half of this was rejected. Both halves
+together reverse that.
 
-The first is a genuine trap worth recording. Realising the cone by inflating
-each node's box by the cone radius before clipping the axis against it is cheap
-and correct laterally — but the inflation is a cube, so it also extends the
-swept region *along* the beam. A carve told to stop a hit-cell short of the
-surface still reached a further cone-radius past that, straight into it. On the
-`cone` fixture — a flat wall, viewed head-on — that alone lost 36% of the
-surface while the cells that survived sat at 0.0000 m RMS. Subtracting the cone
-radius from the axial stop as well fixes it, and the same fixture then scores
-0.00000. Anyone reimplementing this should start there; three more plausible
-explanations (loose per-child radius, the injector reporting axis range rather
-than minimum-over-beam, and under-sampling that minimum at 13/33/65 rays per
-sector) were each measured and each moved the number by less than 0.05.
+**The trap worth recording.** Realising the cone by inflating each node's box by
+the cone radius before clipping the axis against it is cheap and correct
+laterally — but the inflation is a cube, so it also extends the swept region
+*along* the beam. A carve told to stop a hit-cell short of the surface still
+reached a further cone-radius past that, straight into it. On the `cone`
+fixture — a flat wall, head-on — that alone lost 36% of the surface while the
+cells that survived sat at 0.0000 m RMS, which is exactly what a sweep that is
+laterally right and axially long looks like. `t_end` is pulled back by the cone
+radius as well as the hit cell. Anyone reimplementing this should start there;
+three more plausible explanations (loose per-child radius, the injector
+reporting axis range rather than minimum-over-beam, and under-sampling that
+minimum at 13/33/65 rays per sector) were each measured and each moved the
+number by less than 0.05.
 
-The second is why it is not in the tree. Even correct, the carve is only half a
-model change: it sweeps a whole cone free while occupancy is still marked at a
-single leaf on the axis. Cone-wide free against point-wide occupied erodes any
-surface whose beam footprint is much larger than a leaf. With the axial fix in,
-17 of 20 fixtures pass, but the three that do not are the ones that matter:
+**What it is worth.** The fixtures only became able to answer this once the
+injector reported minimum-over-beam rather than range-along-the-axis — before
+that they were scoring the map against a sensor that does not exist. Against
+the faithful injector, with **every threshold below unchanged since before this
+work began**:
 
-| | pencil carve | cone carve |
+| | axis carve, point hit | cone carve, spread hit |
 | --- | --- | --- |
-| `statue-solo` shape recall | 0.9996 | 0.8337 |
-| `statue-solo` false-free | 0.0005 | 0.0586 |
-| `statue-fleet` shape recall | 1.0000 | 0.8654 |
-| `endurance` live nodes | passing | 87,641 (ceiling 60,000) |
+| `corridor` surface RMS (max 0.80) | 0.9654 ✗ | 0.2883 |
+| `corridor` false-occupied (max 0.30) | 0.4619 ✗ | 0.0613 |
+| `statue-solo` surface RMS (max 0.40) | 0.4537 ✗ | 0.2533 |
+| `statue-solo` false-occupied (max 0.10) | 0.1495 ✗ | 0.0280 |
+| `statue-solo` shape recall (min 0.95) | 0.8726 ✗ | 0.9817 |
+| `statue-solo` shape precision (min 0.45) | 0.3912 ✗ | 0.4642 |
+| `statue-solo` shape IoU (min 0.40) | 0.3364 ✗ | 0.4201 |
+| `statue-fleet` shape recall (min 0.95) | 0.8922 ✗ | 0.9812 |
+| `castle-interior` shape recall | 0.9140 | 0.9684 |
 
-Completing the model means spreading the hit across the cone footprint too, at
-reduced weight — a wide beam knows "something is at range R *somewhere* in the
-cone", which is a disjunction an occupancy grid cannot represent directly. That
-is a real piece of work with its own calibration, and it would honestly make the
-map blobbier for wide beams. Until it is done, carving the axis claims less than
-the sensor knows, which is the safe direction to be wrong in.
+Reproduce the left column with `git show 43b3513:src/octomap.c`; the fixture
+recordings are unchanged either way, because the injector is the same. The
+statue rows are scored against the exact triangles (`--mesh`), which is what
+the fixture asserts — scoring against splat centres instead shifts RMS and
+false-occupied upward on both columns without changing the comparison.
+
+One fixture moved the other way and its thresholds *were* relaxed: `cone`
+scores 0.0000 m RMS with a point hit and 0.3235 m with the spread. That is the
+model being honest rather than wrong — the fixture's whole subject is a wide
+beam that cannot localise a surface, and cells now sit up to a footprint radius
+off it by construction. The assertion that still has teeth there is
+`cone_ratio_min`, which compares the wide sensor's mean cell against the narrow
+one's and would collapse to 1 for a map that ignored the declared FOV. The
+relaxation and its reason are written at the threshold itself.
+
+Two calibrations that had to be measured rather than argued:
+
+* **The evidence budget must not be conserved.** Sharing one return's increment
+  out across the cap leaves almost nothing above the occupancy threshold and
+  scores *worse* than not spreading at all — `statue-solo` shape recall 0.5402
+  against 0.8932 at the time it was measured. Un-normalised is both better and
+  the option with no free parameter. What sharpens a surface is not which cell
+  wins one return, it is that looks from different bearings only agree where the
+  surface is.
+* **Node cost, not accuracy, sets the spread depth.** Spreading two octree
+  levels below the footprint scores better on every statue metric and takes
+  `endurance` to 83,697 live nodes against a 60,000 ceiling. One level fits.
 
 **Evidence is weighted.** `covariance` (cm²) and `signal_quality` (%) scale the
 log-odds increment, so a weak return moves the map less than a clean one.

@@ -50,6 +50,7 @@ nothing.
 | `firehose` | 72 sectors × 20 Hz × N vehicles | throughput, the ray-drop path, and that drops are **reported** |
 | `endurance` | 32 simulated minutes over a bounded volume | pruning: memory must plateau, not climb |
 | `pressure` | the same box, over-resolved against an 8 MiB ceiling | the map *at* its cap: pruning must not thrash |
+| `castle-interior` | two drones flying *inside* a scanned castle hall | concave interior geometry — see below |
 
 ### Why `orientations` transcribes the enum twice
 
@@ -97,3 +98,54 @@ GPU, no screenshotting, reproducible in CI. Panels cover occupancy (top and
 side), coverage, divergence and the focused vehicle's contribution, beside the
 figures the run was scored on. Samples live in
 [`docs/assets/fleet-map/`](../assets/fleet-map/).
+
+### Why a room, when there is already a statue
+
+`statue-solo` and `statue-fleet` orbit a standing figure from outside. That is
+the right shape for "does the map look like the thing it mapped", and the wrong
+shape for anything that needs a surface on more than one side of the sensor.
+Three separate defects turned out to be invisible to the statue for exactly
+that reason: the grazing-order bug in `node_apply` (no statue sweep presents its
+misses *after* the hit), the `cone_cm` truncation (which needs a carve cell
+coarser than 5.1 m, where every statue fixture runs 2 m), and the free-space
+veil's overdraw (whose lace is partly an artefact of a thin object in open air).
+
+`castle-interior` is the complement, and the difference is measurable rather
+than asserted. Neighbour states of every free cell:
+
+| | `castle-interior` | `statue-fleet` |
+| --- | --- | --- |
+| free cells enclosed by free on all six faces | 21.3% | 30.0% |
+| neighbours that are **occupied** | **17.5%** | 1.9% |
+| neighbours that are unknown | 9.0% | 26.3% |
+
+Nearly ten times as much free space touches a surface, and the carved volume is
+a third as lacy. Note the first row went the *opposite* way to the prediction
+that motivated the fixture — an interior has fewer fully-enclosed free cells,
+not more, because in a room almost every free cell is near a wall. That is the
+same fact the second row states, and the second row is the one that matters:
+free/occupied boundary per unit volume is where erosion and overdraw live.
+
+**Provenance.** `assets/skokloster_castle.splat` is baked from
+`skokloster-castle.glb` — a photogrammetric scan of *The King's Hall* at
+Skokloster Castle (Skoklosters slott), distributed in the `habitat_test_scenes`
+dataset under **Creative Commons Attribution**. The hall is 18.3 x 24.6 m with
+7.2 m to the vaulting; the scan is a million faces, sampled to 80,000 Gaussians
+at 0.141 m spacing. Regenerate with:
+
+```
+tools/bake_splat.py skokloster-castle.obj assets/skokloster_castle.splat \
+    --height 0 --up z --count 80000
+```
+
+`--height 0` keeps the source scale, because the scan is already in metres, and
+`--up z` is not optional: the tool otherwise takes the longest extent as up and
+would stand a 25 m hall on its end.
+
+**Splat only, no exact triangles.** The `.tri` format stores three vertices per
+triangle, so an exact reference for a million-face scan would be a 36 MB asset
+to score a 0.25 m map. Decimating it is not a way out — quadric decimation of
+this scan plateaus at 52,000 faces with 367 mm of mean deviation, which is worse
+than the leaf it would be scoring. The checker falls back to the splat cloud,
+whose 0.141 m spacing is the floor under this fixture's numbers and sits under
+the leaf.
