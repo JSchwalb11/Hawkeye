@@ -44,6 +44,10 @@ typedef struct {
     // Latched from the map's dirty bits before culling, so a chunk that is
     // off-screen when the map changes still rebuilds when it comes back.
     bool     needs_extract;
+    // Frame this chunk last passed culling, so the translucent second pass can
+    // revisit exactly the chunks the first pass drew without a second walk of
+    // the map's chunk index.
+    uint32_t drawn_frame;
     Matrix  *xf[MAP_RENDER_BUCKETS];
     int      count[MAP_RENDER_BUCKETS];
     int      cap[MAP_RENDER_BUCKETS];
@@ -72,8 +76,12 @@ typedef struct {
     map_draw_mode_t mode;
     bool      visible;
     bool      show_free;
+    // Draw carved cells that are enclosed by other carved cells. Off by
+    // default: they are invisible by construction and cost only overdraw.
+    bool      free_interior;
     float     max_draw_distance_m;
     int       extract_budget;    // chunks re-extracted per frame
+    uint32_t  frame;             // draw counter, for drawn_frame above
 
     map_render_stats_t stats;
 } map_render_t;

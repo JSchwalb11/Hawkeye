@@ -66,6 +66,11 @@ int capture_parse_arg(capture_t *c, int argc, char **argv, int i) {
     }
     if (strcmp(a, "--exit-after") == 0 && next_arg(argc, argv, i, &v)) {
         c->stop_s = atof(v);
+        // A wall-clock timeout is useful on its own -- a CI smoke test wants to
+        // run the viewer for twenty seconds and see it exit, with no frames
+        // written. The timer lives in capture_tick, which does nothing at all
+        // unless the module is active, so this has to switch it on.
+        c->active = true;
         return 2;
     }
     return 0;
@@ -88,6 +93,13 @@ void capture_usage(void) {
 bool capture_begin(capture_t *c, const char *err_prefix) {
     if (!c || !c->active) return true;
     if (!err_prefix) err_prefix = "capture";
+
+    // Timer only: nothing to size, allocate or announce.
+    if (!c->png_dir[0] && !c->gif_path[0]) {
+        c->began_s = GetTime();
+        c->next_due_s = c->began_s + c->start_s;
+        return true;
+    }
 
     const int sw = GetScreenWidth(), sh = GetScreenHeight();
     c->out_w = sw / c->downscale;
@@ -171,6 +183,7 @@ bool capture_tick(capture_t *c) {
         c->finished = true;
         return true;
     }
+    if (!c->png_dir[0] && !c->gif) return false;   // timer only
     if (now < c->next_due_s) return false;
     c->next_due_s = now + 1.0 / c->fps;
 

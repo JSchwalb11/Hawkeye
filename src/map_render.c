@@ -118,12 +118,32 @@ typedef struct {
     const octomap_t *map;
 } extract_ctx_t;
 
+// Is every face neighbour of this carved cell also carved?
+//
+// Such a cell is enclosed by its own neighbours from every direction, so it can
+// never be seen: it contributes nothing but overdraw. Dropping the interior and
+// keeping only the boundary -- the frontier against unknown space, and the skin
+// against surfaces -- draws the same volume with far fewer cells.
+static bool free_interior(const octomap_t *m, const om_leaf_t *leaf) {
+    for (int axis = 0; axis < 3; axis++) {
+        for (int sgn = -1; sgn <= 1; sgn += 2) {
+            double p[3] = { leaf->center[0], leaf->center[1], leaf->center[2] };
+            p[axis] += sgn * leaf->size;
+            if (octomap_query(m, p[0], p[1], p[2]) != OM_FREE) return false;
+        }
+    }
+    return true;
+}
+
 static void extract_leaf(const om_leaf_t *leaf, void *user) {
     extract_ctx_t *x = (extract_ctx_t *)user;
     if (leaf->state == OM_UNKNOWN) return;
 
     const bool occupied = (leaf->state == OM_OCCUPIED);
-    if (!occupied && !x->r->show_free) return;
+    if (!occupied) {
+        if (!x->r->show_free) return;
+        if (!x->r->free_interior && free_interior(x->map, leaf)) return;
+    }
 
     int bucket;
     switch (x->r->mode) {
@@ -188,6 +208,9 @@ int map_render_init(map_render_t *r) {
     r->show_free = true;
     r->max_draw_distance_m = 400.0f;
     r->extract_budget = 24;
+    // Frame 0 is never a valid "drawn this frame" stamp, because a fresh chunk
+    // is zeroed and would otherwise claim to have been drawn already.
+    r->frame = 1;
 
     if (!table_alloc(r, MR_INITIAL_CHUNKS)) return -1;
 
@@ -291,6 +314,24 @@ static bool frustum_sphere(const frustum_t *f, Vector3 c, float radius) {
     return true;
 }
 
+static void draw_bucket(map_render_t *r, map_chunk_t *chunk, int b,
+                        const theme_t *theme) {
+    const Color col = bucket_colour(r, b, theme);
+    r->stats.instances_drawn += (uint32_t)chunk->count[b];
+    r->stats.draw_calls++;
+
+    if (r->instanced) {
+        r->material[b].maps[MATERIAL_MAP_DIFFUSE].color = col;
+        DrawMeshInstanced(r->cube, r->material[b], chunk->xf[b], chunk->count[b]);
+    } else {
+        for (int i = 0; i < chunk->count[b]; i++) {
+            const Matrix *m = &chunk->xf[b][i];
+            const Vector3 p = { m->m12, m->m13, m->m14 };
+            DrawCube(p, m->m0, m->m5, m->m10, col);
+        }
+    }
+}
+
 void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
                      const theme_t *theme) {
     if (!r || !r->ready || !r->visible || !ms) return;
@@ -374,24 +415,42 @@ void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
         }
 
         r->stats.chunks_drawn++;
-        for (int b = 0; b < MAP_RENDER_BUCKETS; b++) {
-            if (chunk->count[b] == 0) continue;
-            const Color col = bucket_colour(r, b, theme);
-            r->stats.instances_drawn += (uint32_t)chunk->count[b];
-            r->stats.draw_calls++;
+        chunk->drawn_frame = r->frame;
 
-            if (r->instanced) {
-                r->material[b].maps[MATERIAL_MAP_DIFFUSE].color = col;
-                DrawMeshInstanced(r->cube, r->material[b], chunk->xf[b], chunk->count[b]);
-            } else {
-                for (int i = 0; i < chunk->count[b]; i++) {
-                    const Matrix *m = &chunk->xf[b][i];
-                    const Vector3 p = { m->m12, m->m13, m->m14 };
-                    DrawCube(p, m->m0, m->m5, m->m10, col);
-                }
-            }
+        // Surfaces first, and only surfaces. Carved space is translucent and is
+        // drawn in a second pass below.
+        for (int b = 0; b < MAP_RENDER_BUCKETS; b++) {
+            if (b == B_FREE || chunk->count[b] == 0) continue;
+            draw_bucket(r, chunk, b, theme);
         }
     }
+
+    // Carved space last, with depth writes off.
+    //
+    // Free cells are 16% alpha, and drawing them with depth writes enabled lets
+    // a pane of empty air z-reject the surface behind it: the cell in front is
+    // barely visible but it still owns the depth buffer. Because B_FREE is
+    // bucket 0 it was being drawn *before* the surfaces in its own chunk, and
+    // chunks are walked in hash order, so which parts of a surface survived was
+    // decided by a hash. Measured on statue-fleet, every drawable leaf was
+    // reaching the GPU -- 380,798 instances against 380,798 in the map -- while
+    // most of the statue was missing from the picture, which is what sent the
+    // first look at this chasing an extraction backlog that does not exist.
+    //
+    // Depth *testing* stays on, so a surface still correctly hides the carved
+    // space behind it. Only the write is suppressed, which is the same thing
+    // vehicle.c does for ghost airframes.
+    rlDrawRenderBatchActive();
+    rlDisableDepthMask();
+    for (uint32_t i = 0; i < r->chunk_cap; i++) {
+        map_chunk_t *chunk = &r->chunks[i];
+        if (!chunk->used || chunk->drawn_frame != r->frame) continue;
+        if (chunk->count[B_FREE] == 0) continue;
+        draw_bucket(r, chunk, B_FREE, theme);
+    }
+    rlDrawRenderBatchActive();
+    rlEnableDepthMask();
+    r->frame++;
 
     // The all-dirty flag is cleared once every live chunk has latched it into
     // its own needs_extract bit -- not once the visible ones have re-extracted.
@@ -400,4 +459,5 @@ void map_render_draw(map_render_t *r, map_session_t *ms, Camera3D camera,
     if (ms->map.all_dirty && all_latched) ms->map.all_dirty = false;
 
     r->stats.extract_ms = (float)((GetTime() - t0) * 1000.0);
+
 }
