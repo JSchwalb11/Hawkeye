@@ -1,10 +1,10 @@
 # Fleet map — deferred work
 
-Everything the fleet-map work left open when it merged (#2) has now been
-resolved except one item, and two defects surfaced along the way that no fixture
-had reached. The record is below: what each turned out to be, and what guards it
-now. Entries are kept after they close, with their numbers, because several of
-them closed by being disproved and the disproof is the useful part.
+Everything the fleet-map work left open when it merged (#2) is now resolved,
+and two defects surfaced along the way that no fixture had reached. The record
+is below: what each turned out to be, and what guards it now. Entries are kept
+after they close, with their numbers, because several of them closed by being
+disproved and the disproof is the useful part.
 
 Issues are disabled on this repository, which is why this lives in the tree
 rather than in a tracker.
@@ -13,22 +13,89 @@ rather than in a tracker.
 
 ## Still open
 
-### Extract carved space at a coarser LOD than surfaces
+### Nothing, for rendering. If anything, extraction.
 
-The unpursued half of the veil work. Greedy meshing took the instance count
-down by merging runs the octree could not, but a chunk bounds a run, so a merge
-is at most one chunk long. Dropping the *resolution* of carved space is the
-other lever and it is untouched.
+The one item that was open here — coarser LOD for carved space — is closed
+below, and it closed as *refuted*. What the measurement that closed it turned
+up instead is that **chunk extraction, not drawing, is where the frame goes**:
+on `statue-fleet` at 0.25 m, `extract_ms` is 6.62 of 7.02 ms, or 94% of the
+frame, and that is CPU work in `map_render_extract` rather than anything the
+GPU does.
 
-The catch is the aggregation rule, and it is the reason this was not just done:
-`lod_rec` reports a coarse cell as free if **any** descendant is free, so a
-mostly-`UNKNOWN` cell would render as carved and quietly overstate coverage —
-in `MAP_DRAW_COVERAGE`, the one view that exists to show what was never looked
-at. A majority-free rule plus a coverage-view check is the work.
+It is not worth attacking yet, because the frame it dominates is already 2x
+inside budget. It is written down because it is the thing to attack *if* the
+budget ever gets tight — a slower CPU, denser maps, many more vehicles — and
+because the obvious target, instance count, is now known to be the wrong one.
+Unlike everything in the table above, extraction cost is hardware-independent,
+so it can be measured anywhere.
 
 ---
 
 # Done
+
+## Extract carved space at a coarser LOD than surfaces
+
+**Closed: measured on real hardware and not worth implementing.** The proposal
+was to drop the resolution of carved space to cut instance count, since greedy
+meshing can only merge within a chunk. The blocker on record was the
+aggregation rule — `lod_rec` reports a coarse cell free if *any* descendant is
+free, so a mostly-`UNKNOWN` cell would render as carved and overstate coverage
+in the one view that exists to show what was never looked at.
+
+That blocker never had to be solved, because the payoff is not there. Measured
+on an RTX 5090 (driver 595.71.05) / Ryzen 9 9950X3D, commit 155ddae, with the
+frame cap removed:
+
+| configuration | median | p95 | instances | draws | extract |
+| --- | --- | --- | --- | --- | --- |
+| statue-fleet, free shown, 0.25 m | 7.02 ms | 8.09 ms | 11,420 | 2,811 | 6.62 ms |
+| statue-fleet, free hidden, 0.25 m | 1.33 ms | 2.53 ms | 3,272 | 405 | 1.04 ms |
+| statue-fleet, free shown, 0.5 m | 6.83 ms | 7.95 ms | 4,200 | 2,680 | 6.42 ms |
+| statue-fleet, free shown, 0.125 m | 8.04 ms | 9.22 ms | 40,145 | 2,937 | 7.61 ms |
+| statue-fleet, free hidden, 0.125 m | 1.64 ms | 2.54 ms | 12,553 | 500 | 1.35 ms |
+| castle, free shown, 0.25 m | 0.57 ms | 2.40 ms | 4,482 | 57 | 0.18 ms |
+| castle, free hidden, 0.25 m | 0.55 ms | 2.32 ms | 3,586 | 41 | 0.13 ms |
+
+**Three findings, in order of how much they should change your mind.**
+
+*Instance count is not the bottleneck.* Going from 0.5 m to 0.125 m leaves
+multiplies the instance count by 9.6x (4,200 to 40,145) and costs 18% more
+frame time (6.83 to 8.04 ms). A renderer bound on instances cannot behave that
+way. The whole optimisation was aimed at a quantity that does not drive cost.
+
+*What free space costs is extraction, not drawing.* `extract_ms` is 94% of the
+frame on statue-fleet, and hiding free space takes it from 6.62 ms to 1.04 ms.
+That is why "hide free" looks like a huge win — but it is CPU map-building
+work, not rasterisation, and a rendering LOD would not remove it. It is also
+entirely scene-dependent: on the castle the same switch saves 0.02 ms, 3.5%.
+
+*There is no leaf size where this drops below 60 fps.* The worst configuration
+tested — 0.125 m with free space shown, 40,145 instances — runs at 124 fps, and
+p95 never exceeds 9.22 ms against a 16.67 ms budget. Even the *ceiling* of the
+optimisation, deleting carved space from the draw entirely, improves a frame
+that was already 2x inside budget.
+
+**The methodological finding is the one to carry forward: llvmpipe did not just
+exaggerate, it inverted the diagnosis.** Every renderer number in this document
+above this entry came from Mesa llvmpipe under Xvfb, where the same scene costs
+347 ms against the GPU's 7.02 — 30-50x. A constant factor would have been
+harmless. But a software rasteriser pays per-instance costs a GPU does not, so
+it ranked variants by instance count and made instance count look decisive,
+which is exactly the conclusion this measurement overturns. Renderer changes
+justified only by llvmpipe should be treated as unproven.
+
+**A measurement trap worth knowing before anyone repeats this.** `main.c` calls
+`SetTargetFPS(60)`, so every configuration from 3,272 to 40,145 instances
+reports exactly 16.67 ms and the renderer looks identical at all settings. The
+cap has to come off before any of this is measurable. Instrumentation for it is
+on `measure/frame-stats-instrumentation` as a single droppable commit.
+
+**Not measured:** GPU-side time in isolation (no timer queries — the "GPU is
+not the constraint" conclusion is inferred from 9.6x instances costing 18%
+time, not measured directly), one GPU and driver only, no thermal soak, and no
+run combining live vehicles with map replay.
+
+---
 
 ## A sub-voxel offset on occupied leaves
 
@@ -186,6 +253,16 @@ configuration, re-measured here so every row is comparable.
 | merged boxes, one fixed cell of gap | 65.3% | 94,917 | 162,203 | 219 ms |
 | merged boxes, interior drawn, gap 0.78 | 70.2% | 79,226 | 146,436 | 223 ms |
 | merged boxes, interior culled on the grid, gap 0.92 | 71.3% | 91,716 | 249,760 | 325 ms |
+
+**Read the frame column with care — it is llvmpipe, and llvmpipe lied.** The
+same scenes measured on an RTX 5090 render in 7.02 ms where this table says
+347 ms: the software rasteriser overstates cost by roughly 30-50x, which would
+be merely useless if it were a constant factor. It is not. On real hardware
+instance count barely drives frame time at all — 9.6x the instances costs 18%
+more time — so a column that ranks variants by instance count ranks them by
+something the GPU is not paying for. The *legibility* and *veil px* columns are
+resolution-dependent but hardware-independent, and they are what the shipping
+choice actually rests on. See the closed follow-up below.
 
 **Conserving the seam area is not enough, and that is the part worth knowing.**
 Shrinking a merged box by the per-cell 0.92 leaves exactly the gap its cells
