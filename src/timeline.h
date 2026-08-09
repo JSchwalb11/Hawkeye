@@ -99,8 +99,10 @@ typedef struct {
     // truncated value means a reconstruction places a *smaller* occupied cell
     // than live did for exactly the wide-beam sensors where the widening
     // matters most -- "live is replay with the playhead pinned to now" quietly
-    // stops being true. No fixture reaches 2.55 m today, so this is a
-    // correctness fix without a regression test behind it.
+    // stops being true. No scored fixture reaches 2.55 m; the wide-beam case in
+    // test_map_units is what holds the width, by scrubbing a 40 m return from a
+    // 25-degree beam back and forward again and comparing the reconstructed
+    // cell's size against the one live placed.
     uint16_t cone_cm;
     uint8_t  vehicle_id;
     uint8_t  hit;
