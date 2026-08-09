@@ -181,8 +181,8 @@ uint64_t timeline_add_ray(timeline_t *tl, const om_ray_t *ray, int64_t t_ns) {
     r.weight_q = (uint8_t)lrintf(w * 255.0f);
     float cone_cm = ray->cone_radius_m * 100.0f;
     if (cone_cm < 0.0f) cone_cm = 0.0f;
-    if (cone_cm > 255.0f) cone_cm = 255.0f;
-    r.cone_cm = (uint8_t)lrintf(cone_cm);
+    if (cone_cm > 65535.0f) cone_cm = 65535.0f;
+    r.cone_cm = (uint16_t)lrintf(cone_cm);
     r.flags = 0;
 
     const uint64_t seq = tl->ray_total;

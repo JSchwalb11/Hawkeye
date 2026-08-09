@@ -77,6 +77,53 @@ flight; the `empty` fixture asserts zero occupied cells.
 endpoint with distance by choosing a coarser depth for it. A 25° sonar at 12 m
 produces a 2 m cell where a 1° laser produces a 0.25 m one.
 
+The *carve*, though, is still a pencil ray along the beam axis. That asymmetry
+is deliberate, and it was measured rather than assumed — see below.
+
+### Why the carve is a ray and not a cone
+
+A beam is physically a cone, and a proximity sensor reports the nearest surface
+anywhere within it, so everything inside the cone nearer than the reported range
+is provably empty. Carving that cone instead of its axis would close the gaps
+between adjacent sectors — a 1.7° fan at 35 m leaves about a metre between
+neighbouring rays, which is why the carved volume is a bundle of thin cones with
+unobserved space between them rather than a solid region.
+
+It was implemented and scored. Two things came out of it.
+
+The first is a genuine trap worth recording. Realising the cone by inflating
+each node's box by the cone radius before clipping the axis against it is cheap
+and correct laterally — but the inflation is a cube, so it also extends the
+swept region *along* the beam. A carve told to stop a hit-cell short of the
+surface still reached a further cone-radius past that, straight into it. On the
+`cone` fixture — a flat wall, viewed head-on — that alone lost 36% of the
+surface while the cells that survived sat at 0.0000 m RMS. Subtracting the cone
+radius from the axial stop as well fixes it, and the same fixture then scores
+0.00000. Anyone reimplementing this should start there; three more plausible
+explanations (loose per-child radius, the injector reporting axis range rather
+than minimum-over-beam, and under-sampling that minimum at 13/33/65 rays per
+sector) were each measured and each moved the number by less than 0.05.
+
+The second is why it is not in the tree. Even correct, the carve is only half a
+model change: it sweeps a whole cone free while occupancy is still marked at a
+single leaf on the axis. Cone-wide free against point-wide occupied erodes any
+surface whose beam footprint is much larger than a leaf. With the axial fix in,
+17 of 20 fixtures pass, but the three that do not are the ones that matter:
+
+| | pencil carve | cone carve |
+| --- | --- | --- |
+| `statue-solo` shape recall | 0.9996 | 0.8337 |
+| `statue-solo` false-free | 0.0005 | 0.0586 |
+| `statue-fleet` shape recall | 1.0000 | 0.8654 |
+| `endurance` live nodes | passing | 87,641 (ceiling 60,000) |
+
+Completing the model means spreading the hit across the cone footprint too, at
+reduced weight — a wide beam knows "something is at range R *somewhere* in the
+cone", which is a disjunction an occupancy grid cannot represent directly. That
+is a real piece of work with its own calibration, and it would honestly make the
+map blobbier for wide beams. Until it is done, carving the axis claims less than
+the sensor knows, which is the safe direction to be wrong in.
+
 **Evidence is weighted.** `covariance` (cm²) and `signal_quality` (%) scale the
 log-odds increment, so a weak return moves the map less than a clean one.
 

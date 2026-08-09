@@ -93,10 +93,18 @@ typedef struct {
     int64_t  t_ns;
     float    origin[3];
     float    endpoint[3];
+    // Cone radius in centimetres. Sixteen bits rather than eight, because the
+    // eight-bit version saturated at 2.55 m and a 25-degree sonar passes that
+    // at 12 m of range. The map sizes the endpoint cell from this, so a
+    // truncated value means a reconstruction places a *smaller* occupied cell
+    // than live did for exactly the wide-beam sensors where the widening
+    // matters most -- "live is replay with the playhead pinned to now" quietly
+    // stops being true. No fixture reaches 2.55 m today, so this is a
+    // correctness fix without a regression test behind it.
+    uint16_t cone_cm;
     uint8_t  vehicle_id;
     uint8_t  hit;
     uint8_t  weight_q;     // weight * 255
-    uint8_t  cone_cm;      // cone radius in centimetres, saturating
     uint8_t  flags;
 } tl_ray_t;
 
