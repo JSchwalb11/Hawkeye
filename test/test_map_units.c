@@ -282,7 +282,12 @@ static void test_wide_cone_survives_replay(void) {
     map_session_config_t cfg;
     map_session_config_defaults(&cfg);
     cfg.max_depth = 12;          // 1 m leaves under the fixed 4096 m root
-    cfg.coarse_depth = 9;        // 8 m far-field carving, as --map-res derives it
+    // 16 m far-field carving. The endpoint cell can never be coarser than this
+    // one, and the cone model places the return a level below the footprint, so
+    // at the 8 m the --map-res default derives both an 8.87 m cone and a
+    // truncated 2.55 m one land on the same 4 m cell and this test would pass
+    // whatever the field width was. Two levels of headroom keeps them apart.
+    cfg.coarse_depth = 8;
     cfg.map_byte_cap = 16u << 20;
     cfg.ray_log_bytes = 1u << 20;
     cfg.keyframe_bytes = 8u << 20;
