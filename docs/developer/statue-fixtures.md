@@ -88,18 +88,18 @@ the precision section below for why that distinction has teeth.
 
 | | solo | fleet |
 | --- | --- | --- |
-| surface RMS | 0.331 m | 0.339 m |
-| false-occupied | 0.052 | 0.060 |
-| false-free | 0.0010 | 0.0026 |
+| surface RMS | 0.253 m | 0.262 m |
+| false-occupied | 0.028 | 0.033 |
+| false-free | 0.0011 | 0.0028 |
 | shape recall | 0.9817 | 0.9812 |
 | shape precision (strict / ±1 voxel) | 0.464 / 0.978 | 0.464 / 0.978 |
 | shape IoU (strict, 1 m lattice) | 0.420 | 0.424 |
 | whole-cloud coverage | 0.816 | 0.830 |
-| merged surface | — | 0.9974 |
-| best single drone alone | — | 0.350 |
+| merged surface | — | 0.9972 |
+| best single drone alone | — | 0.353 |
 
 The fleet reaches more of the statue in half the time, and no single drone
-accounts for more than 35% of the observed surface. That is the cooperative
+accounts for more than 36% of the observed surface. That is the cooperative
 claim on a real object rather than on a box.
 
 These are the figures for the **beam** sensor model — carving the cone and
@@ -108,12 +108,13 @@ read better on every row (0.243 m RMS, 0.9996 recall, 0.526 strict precision)
 and was scored against an injector that reported range along the beam axis
 rather than the nearest surface anywhere in the beam, which is not what
 `OBSTACLE_DISTANCE` means. Against a faithful injector the same map scores
-0.5182 m and 0.8726 — the numbers got worse because the sensor got real, and
-the beam model is what brings them back inside thresholds that never moved.
-See [fleet-map.md](fleet-map.md#why-the-beam-is-modelled-as-a-beam).
+0.4537 m RMS and 0.8726 recall and fails five thresholds — the numbers got
+worse because the sensor got real, and the beam model is what brings them back
+inside thresholds that never moved. See
+[fleet-map.md](fleet-map.md#why-the-beam-is-modelled-as-a-beam).
 
-Read the residual honestly: at 0.25 m leaves a 0.33 m RMS is a leaf and a third,
-and it is dominated by the footprint spread rather than by scatter — ±1-voxel
+Read the residual honestly: at 0.25 m leaves a 0.25 m RMS is one leaf, and it
+is dominated by the footprint spread rather than by scatter — ±1-voxel
 precision is 0.978 while strict precision is 0.464, which is the signature of
 cells sitting *near* the surface rather than in the wrong place.
 

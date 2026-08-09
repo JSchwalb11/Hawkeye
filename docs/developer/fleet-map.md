@@ -120,15 +120,19 @@ work began**:
 | --- | --- | --- |
 | `corridor` surface RMS (max 0.80) | 0.9654 ✗ | 0.2883 |
 | `corridor` false-occupied (max 0.30) | 0.4619 ✗ | 0.0613 |
-| `statue-solo` surface RMS (max 0.40) | 0.5182 ✗ | 0.3310 |
-| `statue-solo` false-occupied (max 0.10) | 0.1794 ✗ | 0.0516 |
+| `statue-solo` surface RMS (max 0.40) | 0.4537 ✗ | 0.2533 |
+| `statue-solo` false-occupied (max 0.10) | 0.1495 ✗ | 0.0280 |
 | `statue-solo` shape recall (min 0.95) | 0.8726 ✗ | 0.9817 |
 | `statue-solo` shape precision (min 0.45) | 0.3912 ✗ | 0.4642 |
+| `statue-solo` shape IoU (min 0.40) | 0.3364 ✗ | 0.4201 |
 | `statue-fleet` shape recall (min 0.95) | 0.8922 ✗ | 0.9812 |
 | `castle-interior` shape recall | 0.9140 | 0.9684 |
 
 Reproduce the left column with `git show 43b3513:src/octomap.c`; the fixture
-recordings are unchanged either way, because the injector is the same.
+recordings are unchanged either way, because the injector is the same. The
+statue rows are scored against the exact triangles (`--mesh`), which is what
+the fixture asserts — scoring against splat centres instead shifts RMS and
+false-occupied upward on both columns without changing the comparison.
 
 One fixture moved the other way and its thresholds *were* relaxed: `cone`
 scores 0.0000 m RMS with a point hit and 0.3235 m with the spread. That is the
