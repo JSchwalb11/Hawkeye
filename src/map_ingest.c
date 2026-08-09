@@ -98,15 +98,34 @@ void map_ingest_note_rejected(map_ingest_t *mi) {
 static void maintain(map_ingest_t *mi, octomap_t *map, float dt) {
     mi->since_prune_s += dt;
 
-    const size_t bytes = octomap_bytes(map);
+    // Pressure is measured against the tree, not against the pool.
+    //
+    // `octomap_bytes` reports capacity, and the pool never shrinks -- so a map
+    // that once grew past the pressure fraction stayed above it for the rest of
+    // the session no matter how much pruning reclaimed, and a full-tree prune
+    // then ran on *every* drain. Measured on statue-solo with a 16 MiB cap:
+    // 1741 passes against 24, and sustained throughput fell from 114k rays/s to
+    // 7.6k. `octomap_live_bytes` discounts the free list, so a productive prune
+    // actually relieves the pressure that triggered it.
     const bool pressured = map->byte_cap > 0 &&
-        (double)bytes > (double)map->byte_cap * (double)mi->prune_pressure;
+        (double)octomap_live_bytes(map) >
+        (double)map->byte_cap * (double)mi->prune_pressure;
 
-    if (pressured || mi->since_prune_s >= mi->prune_interval_s) {
-        mi->stats.last_prune_reclaimed = octomap_prune(map);
-        mi->stats.prune_count++;
-        mi->since_prune_s = 0.0f;
-    }
+    // Even so, a map can be genuinely full with nothing left to collapse: at
+    // the cap, subdivision is refused rather than granted, so the tree stops
+    // changing shape and every pass finds the same unprunable nodes. A pass
+    // that reclaimed nothing is evidence that the next one will too, so drop
+    // back to the periodic schedule and let the interval decide when the tree
+    // has had time to change. That bounds the worst case at one walk per
+    // interval instead of one per drain.
+    const bool due = mi->since_prune_s >= mi->prune_interval_s;
+    if (!due && (!pressured || mi->prune_barren)) return;
+
+    const uint32_t reclaimed = octomap_prune(map);
+    mi->stats.last_prune_reclaimed = reclaimed;
+    mi->stats.prune_count++;
+    mi->since_prune_s = 0.0f;
+    mi->prune_barren = (reclaimed == 0);
 }
 
 static uint32_t drain_n(map_ingest_t *mi, octomap_t *map, uint32_t budget) {

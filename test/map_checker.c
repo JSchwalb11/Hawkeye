@@ -179,6 +179,7 @@ typedef struct {
     uint32_t nodes_before_prune, nodes_after_prune;
     uint32_t blocks_reclaimed;
     uint64_t prunes_total;        // blocks collapsed across the whole run
+    uint64_t prune_passes;
     double   rays_per_s;
     uint64_t rays_inserted, rays_dropped;
     uint64_t drop_events;
@@ -377,6 +378,7 @@ static int replay_tlog(map_session_t *ms, const char *tlog_path, const truth_t *
     rep->peak_bytes = ms->map.stats.peak_bytes;
     rep->end_bytes = octomap_bytes(&ms->map);
     rep->prunes_total = ms->map.stats.prunes;
+    rep->prune_passes = ms->ingest.stats.prune_count;
     (void)t;
     return 0;
 }
@@ -880,6 +882,9 @@ static int assert_thresholds(const truth_t *t, const report_t *r) {
 
     // And proof that pruning actually ran, rather than that the geometry
     // happened to saturate.
+    if (th->prune_passes_max > 0 && (int64_t)r->prune_passes > th->prune_passes_max)
+        bad += fail("prune passes", (double)r->prune_passes, ">",
+                    (double)th->prune_passes_max);
     if (th->prune_blocks_min > 0 && (int64_t)r->prunes_total < th->prune_blocks_min)
         bad += fail("blocks pruned", (double)r->prunes_total, "<",
                     (double)th->prune_blocks_min);
@@ -946,6 +951,7 @@ static void print_report(const truth_t *t, const report_t *r) {
            r->nodes_before_prune, r->nodes_after_prune, r->blocks_reclaimed);
     printf("  live nodes half/end    %u / %u\n", r->half_nodes, r->end_nodes);
     printf("  blocks pruned (run)    %llu\n", (unsigned long long)r->prunes_total);
+    printf("  prune passes           %llu\n", (unsigned long long)r->prune_passes);
     printf("  rays inserted/dropped  %llu / %llu  (%llu drop events)\n",
            (unsigned long long)r->rays_inserted, (unsigned long long)r->rays_dropped,
            (unsigned long long)r->drop_events);

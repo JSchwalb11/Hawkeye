@@ -58,6 +58,7 @@ set(HAWKEYE_FIXTURES
     weak
     firehose
     endurance
+    pressure
     cooperative
     statue-solo
     statue-fleet

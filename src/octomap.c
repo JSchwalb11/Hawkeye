@@ -39,6 +39,13 @@ size_t octomap_bytes(const octomap_t *m) {
          + (size_t)m->chunk_cap * sizeof(om_chunk_slot_t);
 }
 
+size_t octomap_live_bytes(const octomap_t *m) {
+    const uint32_t pooled = m->free_blocks * OM_NODES_PER_BLOCK;
+    const uint32_t live = (m->node_count > pooled) ? m->node_count - pooled : 0;
+    return (size_t)live * sizeof(om_node_t)
+         + (size_t)m->chunk_cap * sizeof(om_chunk_slot_t);
+}
+
 // ---------------------------------------------------------------- chunks
 
 static uint64_t chunk_hash(int64_t key) {

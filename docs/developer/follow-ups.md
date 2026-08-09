@@ -1,9 +1,12 @@
 # Fleet map — deferred work
 
-Five items left on the table when the fleet-map work merged (#2). None of them
-blocks that change; each is written up here with the measurement that motivates
-it, so the next person does not have to rediscover the number before deciding
-whether it is worth the effort.
+Items left on the table when the fleet-map work merged (#2). None of them blocks
+that change; each is written up here with the measurement that motivates it, so
+the next person does not have to rediscover the number before deciding whether
+it is worth the effort.
+
+**Item 1 is done** — see the "Done" section at the end for what it turned out
+to be and what now guards it.
 
 Issues are disabled on this repository, which is why these live in the tree
 rather than in a tracker. If issues are turned on, each heading below is a
@@ -13,43 +16,7 @@ Ordered by what I would do first, not by size.
 
 ---
 
-## 1. Pruning walks the whole tree on every drain once the byte cap is reached
-
-**The only measured performance cliff in the map.**
-
-`map_ingest_drain` calls `octomap_prune` after inserting rays, and `prune_rec`
-recurses from the root over the entire tree every time. While the pool still has
-headroom this is cheap relative to the insert work. Once the map reaches
-`byte_cap` and subdivision starts being refused, the prune fires on *every*
-drain and each one is a full traversal.
-
-**Measured: the same replay goes from 3.5 s to over five minutes** once the cap
-is hit. The map stays correct throughout — it just spends effectively all of its
-time in `prune_rec`.
-
-It only bites at the cap. The default is `--map-cap 256` (MiB) and no fixture in
-CI reaches it; the runs that do are long sessions on a fine `--map-res`, which is
-exactly where someone would notice the viewer stop responding.
-
-*Where:* `src/octomap.c` (`prune_rec`, `octomap_prune`), `src/map_ingest.c`.
-
-Directions worth measuring:
-
-- **Prune on demand, not on schedule.** Run only when `block_alloc` actually
-  fails or the free list is empty, rather than after every drain.
-- **Amortise the walk.** Keep a rotating cursor over the chunk index and prune
-  one slice per drain, so per-frame cost is bounded regardless of tree size.
-- **Track prunable subtrees.** A node only becomes prunable when its children
-  are all leaves and their log-odds converge, which is knowable at `node_apply`
-  time — a dirty-for-prune set turns the full walk into a worklist.
-
-Whichever route, it wants a number attached. `endurance` already asserts an
-absolute live-node ceiling and a blocks-reclaimed floor; a sustained-rays/s
-floor *at the cap* would make a regression visible.
-
----
-
-## 2. No regression test behind the `cone_cm` width fix
+## 1. No regression test behind the `cone_cm` width fix
 
 `tl_ray_t.cone_cm` was a `uint8` in centimetres, saturating at 2.55 m. A 25°
 sonar passes that at 12 m of range. The map sizes the endpoint cell from this
@@ -71,7 +38,7 @@ Small, self-contained, and it protects a fix that is currently on trust.
 
 ---
 
-## 3. Complete the cone sensor model, or keep the axis carve deliberately
+## 2. Complete the cone sensor model, or keep the axis carve deliberately
 
 Built, measured and **not** shipped in #2. Full reasoning is in
 [`fleet-map.md`](fleet-map.md) under "Why the carve is a ray and not a cone".
@@ -131,7 +98,7 @@ close this.**
 
 ---
 
-## 4. The free-space veil is still hazier than it needs to be
+## 3. The free-space veil is still hazier than it needs to be
 
 After the compositing fix, **72.2%** of surface pixels still read as surface
 against a free-hidden reference frame — up from 34.2%, but not 100%. Two
@@ -150,7 +117,7 @@ nobody re-runs it expecting more.
 *identical across all three compositing variants* — the cost is instance
 submission, not blending, so no compositing change will touch it. Culling free
 cells enclosed on all six faces removed only 28%, because the carved volume is
-lace (see item 3).
+lace (see item 2).
 
 Thinning it further needs a different idea than face-neighbour culling. Two
 worth measuring: greedy meshing of contiguous free runs into larger boxes
@@ -161,7 +128,7 @@ overstate coverage in the one view that exists to show it.
 
 ---
 
-## 5. A TSDF is the right representation for centimetre work
+## 4. A TSDF is the right representation for centimetre work
 
 Not a defect — a structural observation, recorded because it keeps coming up.
 
@@ -188,3 +155,44 @@ centimetres in the field.
 
 *Written up when #2 merged. Every figure here came from a run in this
 repository; none of it is estimated.*
+
+---
+
+# Done
+
+## Pruning walked the whole tree on every drain once the byte cap was reached
+
+**Fixed.** The trigger compared `octomap_bytes` — the node pool's *capacity* —
+against the cap. A pool never shrinks, so once a map had grown past the pressure
+fraction it stayed above it for the rest of the session no matter how much
+pruning reclaimed, and a full-tree walk then ran on **every** drain. The map
+stayed correct and simply crawled, which is why no fixture noticed: they all
+assert what the map contains, and none asserted what it costs.
+
+Two changes. Pressure is now measured with `octomap_live_bytes`, which discounts
+the free list, so a productive pass actually relieves the pressure that
+triggered it. And a pass that reclaims nothing stands the map down to the
+interval schedule rather than retrying on the next drain — at the cap,
+subdivision is refused, the tree stops changing shape, and every pass finds the
+same unprunable nodes. That bounds the worst case at one walk per interval.
+
+Measured on `statue-solo`, forcing the cap:
+
+| cap | passes before | passes after | rays/s before | rays/s after |
+| --- | --- | --- | --- | --- |
+| 512 MiB (never reached) | 24 | 24 | 114,365 | 117,850 |
+| 32 MiB | 120 | 24 | 45,164 | 119,466 |
+| 16 MiB | 1,741 | 31 | 7,607 | 119,533 |
+
+Throughput at the cap is now indistinguishable from throughput with room to
+spare, and map quality is unchanged (shape recall 0.99963, IoU 0.490, memory
+still pinned at the ceiling).
+
+Guarded by the new **`pressure`** fixture: the `endurance` box, deliberately
+over-resolved, run against an 8 MiB ceiling. It asserts `prune_passes_max`, a
+count rather than a rate — 13,617 passes against 132 here — because a
+deterministic counter has the same teeth on a slow CI runner as on a fast
+workstation, and a wall-clock floor tight enough to catch a 12x collapse would
+be flaky. `prune_blocks_min` is asserted alongside it so that "few passes"
+cannot be bought by never pruning at all. Mutation-tested: the fixture fails
+against the old trigger.
