@@ -5,8 +5,9 @@ that change; each is written up here with the measurement that motivates it, so
 the next person does not have to rediscover the number before deciding whether
 it is worth the effort.
 
-**Item 1 is done** — see the "Done" section at the end for what it turned out
-to be and what now guards it.
+**Item 1 is done**, and so is the instance-count half of **item 3** — see the
+"Done" section at the end for what each turned out to be and what now guards
+it.
 
 Issues are disabled on this repository, which is why these live in the tree
 rather than in a tracker. If issues are turned on, each heading below is a
@@ -101,8 +102,9 @@ close this.**
 ## 3. The free-space veil is still hazier than it needs to be
 
 After the compositing fix, **72.2%** of surface pixels still read as surface
-against a free-hidden reference frame — up from 34.2%, but not 100%. Two
-residuals, both measured:
+against a free-hidden reference frame — up from 34.2%, but not 100%. Greedy
+meshing has since taken it to **74.7%** at 41% fewer instances; what follows is
+the residual that remains.
 
 **Order dependence.** Which of the nearer free cells blend before the nearest
 one wins the depth test still depends on draw order, so the veil's exact shade
@@ -113,18 +115,13 @@ order-independent; measured at **72.9%**, it buys nothing legibility-wise,
 flattens the veil's shading, and needs `RL_BLEND_CUSTOM_SEPARATE`. Recorded so
 nobody re-runs it expecting more.
 
-**Instance count.** 273,375 instances and ~207 ms per frame under llvmpipe,
-*identical across all three compositing variants* — the cost is instance
-submission, not blending, so no compositing change will touch it. Culling free
-cells enclosed on all six faces removed only 28%, because the carved volume is
-lace (see item 2).
-
-Thinning it further needs a different idea than face-neighbour culling. Two
-worth measuring: greedy meshing of contiguous free runs into larger boxes
-(exact, no information lost), or extracting free at a coarser LOD than surfaces
-— which needs an honest majority-free aggregation rule, since the existing
-min/max aggregator would report a mostly-unknown cell as free and quietly
-overstate coverage in the one view that exists to show it.
+**Instance count — addressed by greedy meshing; see the "Done" section.** The
+remaining idea, extracting free at a coarser LOD than surfaces, is **not**
+done. It still needs an honest majority-free aggregation rule, since the
+existing min/max aggregator would report a mostly-unknown cell as free and
+quietly overstate coverage in the one view that exists to show it. Meshing has
+taken the veil to 162,203 instances; whether a further cut is worth that risk
+is now a smaller question than it was.
 
 ---
 
@@ -196,3 +193,70 @@ workstation, and a wall-clock floor tight enough to catch a 12x collapse would
 be flaky. `prune_blocks_min` is asserted alongside it so that "few passes"
 cannot be bought by never pruning at all. Mutation-tested: the fixture fails
 against the old trigger.
+
+---
+
+## The free-space veil cost 273,375 instances because it drew a cube per cell
+
+**Fixed** for the instance-count half of item 3; the order-dependence half is
+still open and stays written up above.
+
+Carved cells are now merged into boxes before they are drawn. The octree has
+already collapsed whatever agreed cube-wise; greedy meshing takes the runs it
+cannot, because a box need not be a cube and need not sit on a power-of-two
+boundary. Each chunk is rasterised into a grid at the extraction LOD, the grid
+is merged x-then-y-then-z, and one instance is emitted per box. The volume is
+unchanged — a re-tiling, not an approximation — and merging stops at a chunk
+boundary, so a run is at most one chunk long: eight cells for the shipping
+configuration, which is the ceiling on what this can buy.
+
+Measured on `statue-fleet`, `--view left --follow-map`, converged frame at
+1280x720 under llvmpipe, cropped to the map viewport. Legibility is the share
+of the free-hidden reference's surface pixels that still read as surface. "Veil
+px" counts every pixel the veil repaints, so a variant cannot buy legibility by
+quietly drawing less carved space without that showing up here. Frame time is
+the median of the last 40 frames on this machine, which is slower than the one
+that recorded the 207 ms in item 3 — the 348 ms below is the same
+configuration, re-measured here so every row is comparable.
+
+| veil | legibility | veil px | instances | frame |
+| --- | --- | --- | --- | --- |
+| a cube per cell, interior culled (was shipping) | 72.2% | 87,388 | 273,375 | 347 ms |
+| a cube per cell, interior drawn | 67.9% | 88,390 | 380,798 | 469 ms |
+| merged boxes, gap 0.92 — the same seam area | 67.7% | 89,928 | 162,203 | 215 ms |
+| merged boxes, gap 0.84 | 70.8% | 83,865 | 162,203 | 214 ms |
+| **merged boxes, gap 0.78 (ships)** | **74.7%** | **78,273** | **162,203** | **211 ms** |
+| merged boxes, gap 0.72 | 76.5% | 75,625 | 162,203 | 219 ms |
+| merged boxes, one fixed cell of gap | 65.3% | 94,917 | 162,203 | 219 ms |
+| merged boxes, interior drawn, gap 0.78 | 70.2% | 79,226 | 146,436 | 223 ms |
+| merged boxes, interior culled on the grid, gap 0.92 | 71.3% | 91,716 | 249,760 | 325 ms |
+
+**Conserving the seam area is not enough, and that is the part worth knowing.**
+Shrinking a merged box by the per-cell 0.92 leaves exactly the gap its cells
+had — 8% of the span either way — and still loses 4.5 points, because eight
+small gaps sample what is behind them in eight places and one large gap samples
+it in one. The veil's legibility was being bought by the *density* of its
+seams, not their area, and merging spends that density. Opening the gap to 0.78
+buys the density back as width; it costs 10% of the veil's painted pixels,
+which is the honest price and is why the veil-px column is in the table.
+
+Two variants are recorded as failures. Capping the merge length does not
+interpolate between meshing and not meshing — rasterising the chunk destroys
+the octree's own merging, and capping runs at 1 or 2 cells leaves 3,849,419 and
+1,190,882 instances at 13.9% and 34.8%, far worse than either end. And culling
+the interior on the grid rather than per leaf keeps almost all the legibility
+(71.3%) but fragments the shell into more boxes than the leaf-level cull, so it
+gives back most of the instance saving.
+
+The leaf-level interior cull stays in front of the merge. Feeding the interior
+in gives the merge more to swallow, and the result is both solider and larger:
+70.2% against 74.7% for 10% fewer instances.
+
+Extraction pays for it — 1.66 ms to 3.79 ms mean per frame, 4.73 ms to 7.10 ms
+worst — against a frame that drops from 347 ms to 211 ms.
+
+Checked in the coverage view specifically, since that is the one view whose job
+is to show what was never looked at: 95.1% to 92.9%, and the same 87,388 to
+78,273 veil pixels. The veil there draws less than it did, never more — meshing
+cannot overstate coverage, because the merge only sets grid cells a carved leaf
+already covered.
