@@ -293,6 +293,64 @@ static void test_manifest_depth(void) {
     }
 }
 
+// --------------------------------------------------------- grazing order
+
+// A cell hit by one ray and then skimmed by the neighbouring sectors of the
+// same sweep must survive, and a genuinely removed obstacle must still clear.
+// Nothing scored reaches this: the fixtures that exercise clearing arrange the
+// misses to arrive on their own, and the ones that exercise dense sweeps happen
+// to present the misses before the hit, where clear-on-hit already rescues the
+// cell. The reverse ordering is just as physical and used to lose the surface
+// outright -- twelve grazing rays after a hit drove the cell to the clamp, and
+// further sweeps never recovered it.
+static void fire_ray(octomap_t *m, double end_x, uint32_t t_ms) {
+    om_ray_t r;
+    memset(&r, 0, sizeof(r));
+    r.endpoint[0] = end_x;
+    r.hit = 1;
+    r.weight = 1.0f;
+    r.time_ms = t_ms;
+    octomap_insert_ray(m, &r);
+}
+
+static om_state_t sweep_cell(bool hit_first, int sweeps, uint32_t spacing_ms) {
+    octomap_t m;
+    octomap_config_t cfg;
+    octomap_config_defaults(&cfg);
+    if (octomap_init(&m, &cfg) != 0) return OM_UNKNOWN;
+
+    uint32_t t = 0;
+    for (int s = 0; s < sweeps; s++) {
+        // The hit terminates in the cell at 10 m; the grazing rays pass through
+        // it and terminate at 20 m, exactly as a neighbouring sector aimed at a
+        // further part of the same surface would.
+        if (hit_first) fire_ray(&m, 10.0, t);
+        for (int i = 0; i < 12; i++) fire_ray(&m, 20.0, t += spacing_ms);
+        if (!hit_first) fire_ray(&m, 10.0, t);
+        t += spacing_ms;
+    }
+    const om_state_t st = octomap_query(&m, 10.0, 0.0, 0.0);
+    octomap_free(&m);
+    return st;
+}
+
+static void test_grazing_order(void) {
+    printf("grazing rays either side of a return\n");
+
+    check(sweep_cell(false, 1, 5) == OM_OCCUPIED,
+          "misses before the hit leave the cell occupied");
+    check(sweep_cell(true, 1, 5) == OM_OCCUPIED,
+          "misses after the hit leave it occupied too");
+    check(sweep_cell(true, 4, 5) == OM_OCCUPIED,
+          "...and still do after four sweeps");
+
+    // The shield is a grace period, not immunity. Spread the same misses over
+    // longer than it lasts and the cell clears -- which is what stops this from
+    // turning a removed obstacle into a permanent one.
+    check(sweep_cell(true, 1, 400) == OM_FREE,
+          "misses spread past the grace window still clear the cell");
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -302,6 +360,7 @@ int main(void) {
     test_negative_increment();
     test_pool_uses_full_budget();
     test_manifest_depth();
+    test_grazing_order();
 
     printf("\n%s (%d failure%s)\n", failures ? "FAIL" : "PASS",
            failures, failures == 1 ? "" : "s");

@@ -20,6 +20,7 @@ void octomap_config_defaults(octomap_config_t *cfg) {
     cfg->byte_cap      = (size_t)256 * 1024 * 1024;
     cfg->refine_dist_m = 1.5;
     cfg->skip_near_m   = 1.0;
+    cfg->hit_grace_ms  = 1000;
 }
 
 double octomap_cell_size(const octomap_t *m, int depth) {
@@ -285,6 +286,7 @@ int octomap_init(octomap_t *m, const octomap_config_t *cfg) {
         if (cfg->byte_cap      > 0)   d.byte_cap      = cfg->byte_cap;
         if (cfg->refine_dist_m > 0.0) d.refine_dist_m = cfg->refine_dist_m;
         if (cfg->skip_near_m  >= 0.0) d.skip_near_m   = cfg->skip_near_m;
+        if (cfg->hit_grace_ms  != 0)  d.hit_grace_ms  = cfg->hit_grace_ms;
     }
     if (d.max_depth > 20) d.max_depth = 20;
     if (d.coarse_depth > d.max_depth) d.coarse_depth = d.max_depth;
@@ -307,6 +309,7 @@ int octomap_init(octomap_t *m, const octomap_config_t *cfg) {
     m->occ_threshold   = OM_OCC_THRESHOLD;
     m->free_threshold  = OM_FREE_THRESHOLD;
     m->prune_tolerance = 6;
+    m->hit_grace_ms    = (d.hit_grace_ms < 0) ? 0u : (uint32_t)d.hit_grace_ms;
     m->contested_pct   = 30;
     m->contested_min_votes = 4;
 
@@ -349,6 +352,40 @@ static void node_apply(octomap_t *m, uint32_t idx, int delta, uint8_t vehicle_id
     om_node_t *n = &m->nodes[idx];
     const uint32_t bit = om_vehicle_bit(vehicle_id);
 
+    // Free evidence arriving just after a range return is not believed.
+    //
+    // The clear-on-hit rule below fixes a cell that was carved *before* it was
+    // ever hit. It does nothing for the reverse, and the reverse happens just
+    // as often: a beam terminates in a cell and then, a few tens of
+    // milliseconds later, the neighbouring sectors of the same sweep skim
+    // straight through it on their way to another part of the same surface.
+    // Measured on a bare cell with twelve grazing rays, the hit-first ordering
+    // left it at the -70 clamp reading FREE, and four more sweeps never
+    // recovered it -- each sweep contributes one hit and a dozen misses.
+    //
+    // A cell cannot tell a grazing pass from an obstacle that was removed:
+    // both are rays passing through and terminating elsewhere. What separates
+    // them is *time*. A sweep goes by in well under a second; a removed
+    // obstacle keeps producing misses for as long as anyone points a sensor at
+    // it. So a return shields its cell for `hit_grace_ms` and no longer, and
+    // the shield measures from the last applied update -- which, while it
+    // holds, is the return itself, because absorbed misses deliberately do not
+    // move `last_seen_ms`.
+    //
+    // Absorbed misses are also kept out of the divergence counters below. A
+    // miss the map has decided not to believe is not evidence a second vehicle
+    // can be said to disagree with.
+    if (delta < 0 && m->hit_grace_ms > 0 && (n->flags & OM_FLAG_FRESH_HIT)) {
+        // Signed, so a stamp that arrives fractionally out of order counts as
+        // inside the window rather than wrapping to fifty days outside it.
+        const int32_t since = (int32_t)(time_ms - n->last_seen_ms);
+        if (since < (int32_t)m->hit_grace_ms) {
+            n->observers |= bit;
+            return;
+        }
+        n->flags &= (uint8_t)~OM_FLAG_FRESH_HIT;
+    }
+
     // Divergence is a fleet signal, not a temporal one. Only evidence from a
     // vehicle other than the ones already on record can contest a cell, so a
     // single vehicle watching an obstacle get removed clears it cleanly instead
@@ -390,7 +427,10 @@ static void node_apply(octomap_t *m, uint32_t idx, int delta, uint8_t vehicle_id
     // of inference drawn from rays that merely passed nearby -- and, because it
     // fires only on a hit, an obstacle that is genuinely removed still gets no
     // resets and still carves away to free, which is what `vanishing` checks.
-    if (delta > 0 && n->log_odds < 0) n->log_odds = 0;
+    if (delta > 0) {
+        if (n->log_odds < 0) n->log_odds = 0;
+        n->flags |= OM_FLAG_FRESH_HIT;
+    }
 
     int lo = (int)n->log_odds + delta;
     if (lo >  OM_LO_CLAMP) lo =  OM_LO_CLAMP;
